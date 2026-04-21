@@ -1,3 +1,8 @@
 .env
 .venv/
 *.plist
+*.log
+*.err
+logs/
+.cursor/
+editor-soul.md

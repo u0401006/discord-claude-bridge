@@ -4,6 +4,7 @@ Discord ↔ Claude Code Bridge
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -40,8 +41,29 @@ TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
+_LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
+SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
+
 # rate limiter: user_id → list of timestamps
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
+
+
+def _load_sessions() -> dict[str, str]:
+    try:
+        with open(SESSIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_sessions() -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(SESSIONS_FILE)), exist_ok=True)
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(_sessions, f)
+
+
+# session tracker: session_key → claude session_id (persisted across restarts)
+_sessions: dict[str, str] = _load_sessions()
 
 def is_rate_limited(user_id: int) -> bool:
     now = time.monotonic()
@@ -70,10 +92,16 @@ def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
     return chunks
 
 
-async def run_claude(prompt: str) -> str:
+async def run_claude(prompt: str, session_key: str) -> str:
+    session_id = _sessions.get(session_key)
+    args = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+    if session_id:
+        args += ["--resume", session_id]
+    args += ["--print", "--output-format", "json", prompt]
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            CLAUDE_BIN, "--print", prompt,
+            *args,
             cwd=WORKING_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -88,7 +116,16 @@ async def run_claude(prompt: str) -> str:
             err = stderr.decode().strip()
             return f"```\nError (exit {proc.returncode}):\n{err[:1800]}\n```"
 
-        return stdout.decode().strip() or "(no output)"
+        raw = stdout.decode().strip()
+        try:
+            data = json.loads(raw)
+            new_id: str | None = data.get("session_id")
+            if new_id:
+                _sessions[session_key] = new_id
+                _save_sessions()
+            return data.get("result") or "(no output)"
+        except json.JSONDecodeError:
+            return raw or "(no output)"
 
     except FileNotFoundError:
         return f"`{CLAUDE_BIN}` not found. Set CLAUDE_BIN in .env."
@@ -132,10 +169,19 @@ async def on_message(message: discord.Message):
     if client.user and content.startswith(f"<@{client.user.id}>"):
         content = content[len(f"<@{client.user.id}>"):].strip()
 
-    log.info(f"Request from {message.author} ({message.author.id}): {content[:80]}")
+    session_key = f"ch{message.channel.id}_u{message.author.id}"
+
+    if content == "!reset":
+        _sessions.pop(session_key, None)
+        _save_sessions()
+        log.info(f"Session reset for {session_key}")
+        await message.channel.send("Session cleared.")
+        return
+
+    log.info(f"Request from {message.author} ({message.author.id}) [{session_key}]: {content[:80]}")
 
     async with message.channel.typing():
-        reply = await run_claude(content)
+        reply = await run_claude(content, session_key)
 
     log.info(f"Response length: {len(reply)} chars")
     for chunk in chunk_text(reply):
