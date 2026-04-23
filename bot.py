@@ -164,9 +164,9 @@ async def on_message(message: discord.Message):
         log.warning(f"Blocked user {message.author} ({message.author.id})")
         return
 
-    # must mention the bot
-    #if client.user not in message.mentions:
-    #    return
+    # ignore if someone else is mentioned but not the bot
+    if message.mentions and client.user not in message.mentions:
+        return
 
     # rate limit
     if is_rate_limited(message.author.id):
