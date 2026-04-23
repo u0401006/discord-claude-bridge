@@ -14,7 +14,14 @@ from collections import defaultdict
 import discord
 from dotenv import load_dotenv
 
-load_dotenv()
+# 支援 --env /path/to/.env，讓多個 bot 實例共用同一份 bot.py
+_env_path: str | None = None
+for _i, _arg in enumerate(sys.argv[1:], 1):
+    if _arg == "--env" and _i < len(sys.argv) - 1:
+        _env_path = sys.argv[_i + 1]
+        break
+
+load_dotenv(_env_path)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,6 +163,10 @@ async def on_message(message: discord.Message):
     if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
         log.warning(f"Blocked user {message.author} ({message.author.id})")
         return
+
+    # must mention the bot
+    #if client.user not in message.mentions:
+    #    return
 
     # rate limit
     if is_rate_limited(message.author.id):
