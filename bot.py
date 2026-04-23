@@ -47,6 +47,7 @@ CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
+DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "2.5"))
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
@@ -59,7 +60,12 @@ _rate_buckets: dict[int, list[float]] = defaultdict(list)
 _turn_counts: dict[str, int] = defaultdict(int)
 
 # stopped sessions: force-stopped by !stop or Claude's [DONE] signal (in-memory)
+# only blocks bot messages; humans can still continue
 _stopped_sessions: set[str] = set()
+
+# debounce: buffer incoming messages, cancel+restart timer on each new message
+_pending: dict[str, asyncio.Task] = {}
+_pending_texts: dict[str, list[str]] = defaultdict(list)
 
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
@@ -68,7 +74,7 @@ _DONE_SIGNAL = "[DONE]"
 _DONE_INSTRUCTION = (
     "[System: When you consider this conversation complete or the task fully done, "
     f"append exactly `{_DONE_SIGNAL}` on its own line at the very end of your response. "
-    "The bridge will then stop forwarding further messages to you.]\n\n"
+    "The bridge will then stop forwarding further bot messages to you.]\n\n"
 )
 
 
@@ -89,6 +95,7 @@ def _save_sessions() -> None:
 # session tracker: session_key → claude session_id (persisted across restarts)
 _sessions: dict[str, str] = _load_sessions()
 
+
 def is_rate_limited(user_id: int) -> bool:
     now = time.monotonic()
     bucket = _rate_buckets[user_id]
@@ -97,6 +104,7 @@ def is_rate_limited(user_id: int) -> bool:
         return True
     _rate_buckets[user_id].append(now)
     return False
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -162,6 +170,56 @@ async def run_claude(prompt: str, session_key: str) -> str:
         return f"Bridge error: {e}"
 
 
+async def _flush(
+    session_key: str,
+    channel: discord.abc.Messageable,
+    author: discord.abc.User,
+    is_bot_author: bool,
+) -> None:
+    """Debounce timer: fires after DEBOUNCE_SECONDS of silence, sends combined prompt."""
+    await asyncio.sleep(DEBOUNCE_SECONDS)
+
+    combined = "\n".join(_pending_texts.pop(session_key, []))
+    _pending.pop(session_key, None)
+
+    if not combined:
+        return
+
+    # [DONE] only blocks bot follow-ups; humans can always continue
+    if session_key in _stopped_sessions and is_bot_author:
+        return
+
+    _turn_counts[session_key] += 1
+    current_turn = _turn_counts[session_key]
+
+    if current_turn > MAX_TURNS:
+        return
+
+    log.info(
+        f"Request from {author} ({author.id}) [{session_key}] "
+        f"turn {current_turn}/{MAX_TURNS}: {combined[:80]}"
+    )
+
+    async with channel.typing():  # type: ignore[arg-type]
+        reply = await run_claude(combined, session_key)
+
+    # Detect Claude's self-exit signal
+    if _DONE_SIGNAL in reply:
+        reply = reply.replace(_DONE_SIGNAL, "").rstrip()
+        _stopped_sessions.add(session_key)
+        reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或輸入 `!reset` 開啟新 session。"
+        log.info(f"Claude signaled [DONE] for {session_key}")
+    elif current_turn == MAX_TURNS:
+        reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
+
+    log.info(f"Response length: {len(reply)} chars")
+    mention = author.mention
+    chunks = chunk_text(reply)
+    for i, chunk in enumerate(chunks):
+        text = f"{mention} {chunk}" if i == 0 else chunk
+        await channel.send(text)  # type: ignore[union-attr]
+
+
 # ── event handlers ────────────────────────────────────────────────────────────
 
 @client.event
@@ -177,9 +235,11 @@ async def on_message(message: discord.Message):
     if message.author == client.user:
         return
 
-    # channel guard
-    if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
+    # channel guard: support threads by checking parent_id against ALLOWED_CHANNEL_IDS
+    if ALLOWED_CHANNEL_IDS:
+        ch_id = getattr(message.channel, "parent_id", None) or message.channel.id
+        if ch_id not in ALLOWED_CHANNEL_IDS:
+            return
 
     # user guard
     if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
@@ -205,6 +265,9 @@ async def on_message(message: discord.Message):
     session_key = f"ch{message.channel.id}_u{message.author.id}"
 
     if content == "!reset":
+        if session_key in _pending:
+            _pending.pop(session_key).cancel()
+        _pending_texts.pop(session_key, None)
         _sessions.pop(session_key, None)
         _turn_counts.pop(session_key, None)
         _stopped_sessions.discard(session_key)
@@ -214,37 +277,31 @@ async def on_message(message: discord.Message):
         return
 
     if content == "!stop":
+        if session_key in _pending:
+            _pending.pop(session_key).cancel()
+        _pending_texts.pop(session_key, None)
         _stopped_sessions.add(session_key)
         log.info(f"Session force-stopped for {session_key}")
         await message.channel.send("Session stopped. 輸入 `!reset` 開啟新 session。")
         return
 
-    if session_key in _stopped_sessions:
+    # dot = silent ack; no reply, no session change (bot-to-bot handshake signal)
+    if content == ".":
+        log.info(f"Dot-ack (silent) for {session_key}")
         return
 
-    _turn_counts[session_key] += 1
-    current_turn = _turn_counts[session_key]
-
-    if current_turn > MAX_TURNS:
+    # fast-path: [DONE] blocks further bot messages immediately, before debounce
+    if session_key in _stopped_sessions and message.author.bot:
         return
 
-    log.info(f"Request from {message.author} ({message.author.id}) [{session_key}] turn {current_turn}/{MAX_TURNS}: {content[:80]}")
-
-    async with message.channel.typing():
-        reply = await run_claude(content, session_key)
-
-    # Detect Claude's self-exit signal
-    if _DONE_SIGNAL in reply:
-        reply = reply.replace(_DONE_SIGNAL, "").rstrip()
-        _stopped_sessions.add(session_key)
-        reply += "\n\n---\n> Claude 已結束此對話。輸入 `!reset` 開啟新 session。"
-        log.info(f"Claude signaled [DONE] for {session_key}")
-    elif current_turn == MAX_TURNS:
-        reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
-
-    log.info(f"Response length: {len(reply)} chars")
-    for chunk in chunk_text(reply):
-        await message.channel.send(chunk)
+    # debounce: buffer content and restart sliding-window timer
+    _pending_texts[session_key].append(content)
+    if session_key in _pending:
+        _pending[session_key].cancel()
+    task = asyncio.create_task(
+        _flush(session_key, message.channel, message.author, message.author.bot)
+    )
+    _pending[session_key] = task
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
