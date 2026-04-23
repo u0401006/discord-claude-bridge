@@ -46,6 +46,7 @@ WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
+MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
@@ -53,6 +54,22 @@ SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
 
 # rate limiter: user_id → list of timestamps
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
+
+# turn counter: session_key → number of turns used (in-memory, resets on bot restart)
+_turn_counts: dict[str, int] = defaultdict(int)
+
+# stopped sessions: force-stopped by !stop or Claude's [DONE] signal (in-memory)
+_stopped_sessions: set[str] = set()
+
+# token Claude uses to signal conversation end
+_DONE_SIGNAL = "[DONE]"
+
+# system instruction injected once at the start of every new session
+_DONE_INSTRUCTION = (
+    "[System: When you consider this conversation complete or the task fully done, "
+    f"append exactly `{_DONE_SIGNAL}` on its own line at the very end of your response. "
+    "The bridge will then stop forwarding further messages to you.]\n\n"
+)
 
 
 def _load_sessions() -> dict[str, str]:
@@ -101,10 +118,15 @@ def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
 
 async def run_claude(prompt: str, session_key: str) -> str:
     session_id = _sessions.get(session_key)
+
+    # Inject exit-signal instruction once on the first turn of a new session
+    if not session_id:
+        prompt = _DONE_INSTRUCTION + prompt
+
     args = [CLAUDE_BIN, "--dangerously-skip-permissions"]
     if session_id:
         args += ["--resume", session_id]
-    args += ["--print", "--output-format", "json", prompt]
+    args += ["--print", "--output-format", "json", "--", prompt]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -184,15 +206,41 @@ async def on_message(message: discord.Message):
 
     if content == "!reset":
         _sessions.pop(session_key, None)
+        _turn_counts.pop(session_key, None)
+        _stopped_sessions.discard(session_key)
         _save_sessions()
         log.info(f"Session reset for {session_key}")
         await message.channel.send("Session cleared.")
         return
 
-    log.info(f"Request from {message.author} ({message.author.id}) [{session_key}]: {content[:80]}")
+    if content == "!stop":
+        _stopped_sessions.add(session_key)
+        log.info(f"Session force-stopped for {session_key}")
+        await message.channel.send("Session stopped. 輸入 `!reset` 開啟新 session。")
+        return
+
+    if session_key in _stopped_sessions:
+        return
+
+    _turn_counts[session_key] += 1
+    current_turn = _turn_counts[session_key]
+
+    if current_turn > MAX_TURNS:
+        return
+
+    log.info(f"Request from {message.author} ({message.author.id}) [{session_key}] turn {current_turn}/{MAX_TURNS}: {content[:80]}")
 
     async with message.channel.typing():
         reply = await run_claude(content, session_key)
+
+    # Detect Claude's self-exit signal
+    if _DONE_SIGNAL in reply:
+        reply = reply.replace(_DONE_SIGNAL, "").rstrip()
+        _stopped_sessions.add(session_key)
+        reply += "\n\n---\n> Claude 已結束此對話。輸入 `!reset` 開啟新 session。"
+        log.info(f"Claude signaled [DONE] for {session_key}")
+    elif current_turn == MAX_TURNS:
+        reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
     log.info(f"Response length: {len(reply)} chars")
     for chunk in chunk_text(reply):
