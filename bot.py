@@ -206,9 +206,13 @@ async def _flush(
     # Detect Claude's self-exit signal
     if _DONE_SIGNAL in reply:
         reply = reply.replace(_DONE_SIGNAL, "").rstrip()
-        _stopped_sessions.add(session_key)
-        reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或輸入 `!reset` 開啟新 session。"
-        log.info(f"Claude signaled [DONE] for {session_key}")
+        if is_bot_author:
+            # bot-to-bot: strip [DONE] but don't block further messages
+            log.info(f"Claude signaled [DONE] for {session_key} (bot author, not stopping)")
+        else:
+            _stopped_sessions.add(session_key)
+            reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或輸入 `!reset` 開啟新 session。"
+            log.info(f"Claude signaled [DONE] for {session_key}")
     elif current_turn == MAX_TURNS:
         reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
