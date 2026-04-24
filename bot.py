@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 
 import discord
@@ -69,6 +70,18 @@ _pending_texts: dict[str, list[str]] = defaultdict(list)
 
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
+
+# silent-ack patterns: any message whose stripped content matches one of these
+# is dropped without calling Claude (covers ASCII and CJK punctuation)
+_ACK_CONTENT: frozenset[str] = frozenset({".", "。", "·", "…", "...", "、"})
+
+
+def _is_punct_only(text: str) -> bool:
+    """Return True if every character in text is punctuation, symbol, or whitespace."""
+    return bool(text) and all(
+        unicodedata.category(c)[0] in {"P", "S", "Z"} or c.isspace()
+        for c in text
+    )
 
 # system instruction injected once at the start of every new session
 _DONE_INSTRUCTION = (
@@ -206,13 +219,15 @@ async def _flush(
     # Detect Claude's self-exit signal
     if _DONE_SIGNAL in reply:
         reply = reply.replace(_DONE_SIGNAL, "").rstrip()
-        if is_bot_author:
-            # bot-to-bot: strip [DONE] but don't block further messages
-            log.info(f"Claude signaled [DONE] for {session_key} (bot author, not stopping)")
-        else:
-            _stopped_sessions.add(session_key)
+        _stopped_sessions.add(session_key)
+        log.info(f"Claude signaled [DONE] for {session_key}")
+        if not is_bot_author:
             reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或輸入 `!reset` 開啟新 session。"
-            log.info(f"Claude signaled [DONE] for {session_key}")
+    elif is_bot_author and _is_punct_only(reply):
+        # Claude returned pure punctuation in a bot-to-bot turn → auto-stop to break loop
+        _stopped_sessions.add(session_key)
+        log.info(f"Claude punct-only reply in bot session, auto-stop for {session_key}")
+        return  # send nothing; silence breaks the ping-pong
     elif current_turn == MAX_TURNS:
         reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
@@ -289,9 +304,9 @@ async def on_message(message: discord.Message):
         await message.channel.send("Session stopped. 輸入 `!reset` 開啟新 session。")
         return
 
-    # dot = silent ack; no reply, no session change (bot-to-bot handshake signal)
-    if content == ".":
-        log.info(f"Dot-ack (silent) for {session_key}")
+    # silent ack: known ack tokens OR any all-punctuation message from a bot
+    if content in _ACK_CONTENT or (message.author.bot and _is_punct_only(content)):
+        log.info(f"Ack-drop ({content!r}) for {session_key}")
         return
 
     # fast-path: [DONE] blocks further bot messages immediately, before debounce
