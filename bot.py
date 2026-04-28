@@ -254,6 +254,10 @@ async def on_message(message: discord.Message):
     if message.author == client.user:
         return
 
+    # ignore system messages (thread_created, pins, joins, etc.)
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+        return
+
     # channel guard: support threads by checking parent_id against ALLOWED_CHANNEL_IDS
     if ALLOWED_CHANNEL_IDS:
         ch_id = getattr(message.channel, "parent_id", None) or message.channel.id
@@ -265,8 +269,8 @@ async def on_message(message: discord.Message):
         log.warning(f"Blocked user {message.author} ({message.author.id})")
         return
 
-    # ignore if someone else is mentioned but not the bot
-    if message.mentions and client.user not in message.mentions:
+    # ignore if someone/some role is mentioned but not the bot
+    if (message.mentions or message.role_mentions) and client.user not in message.mentions:
         return
 
     # rate limit
