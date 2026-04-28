@@ -164,12 +164,6 @@ async def run_claude(prompt: str, session_key: str) -> str:
 
         if proc.returncode != 0:
             err = stderr.decode().strip()
-            if "No conversation found" in err and session_id:
-                # stale session: clear and retry as new conversation
-                log.warning(f"Stale session {session_id} for {session_key}, retrying as new")
-                _sessions.pop(session_key, None)
-                _save_sessions()
-                return await run_claude(prompt, session_key)
             return f"```\nError (exit {proc.returncode}):\n{err[:1800]}\n```"
 
         raw = stdout.decode().strip()
@@ -275,8 +269,8 @@ async def on_message(message: discord.Message):
         log.warning(f"Blocked user {message.author} ({message.author.id})")
         return
 
-    # ignore if someone else is mentioned but not the bot
-    if message.mentions and client.user not in message.mentions:
+    # ignore if someone/some role is mentioned but not the bot
+    if (message.mentions or message.role_mentions) and client.user not in message.mentions:
         return
 
     # rate limit
