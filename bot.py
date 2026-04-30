@@ -49,6 +49,7 @@ TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "2.5"))
+STREAM_END_SIGNAL = os.getenv("STREAM_END_SIGNAL", "[STREAM_END]")
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
@@ -67,6 +68,9 @@ _stopped_sessions: set[str] = set()
 # debounce: buffer incoming messages, cancel+restart timer on each new message
 _pending: dict[str, asyncio.Task] = {}
 _pending_texts: dict[str, list[str]] = defaultdict(list)
+
+# thread redirect: session_key → channel to reply to (updated by on_thread_create)
+_pending_channel: dict[str, discord.abc.Messageable] = {}
 
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
@@ -188,9 +192,12 @@ async def _flush(
     channel: discord.abc.Messageable,
     author: discord.abc.User,
     is_bot_author: bool,
+    immediate: bool = False,
 ) -> None:
     """Debounce timer: fires after DEBOUNCE_SECONDS of silence, sends combined prompt."""
-    await asyncio.sleep(DEBOUNCE_SECONDS)
+    await asyncio.sleep(0 if immediate else DEBOUNCE_SECONDS)
+    # Use thread-redirected channel if on_thread_create updated it
+    channel = _pending_channel.pop(session_key, channel)  # type: ignore[assignment]
 
     combined = "\n".join(_pending_texts.pop(session_key, []))
     _pending.pop(session_key, None)
@@ -250,6 +257,15 @@ async def on_ready():
 
 
 @client.event
+async def on_thread_create(thread: discord.Thread) -> None:
+    """Redirect pending session replies into a newly created thread."""
+    for sk, ch in list(_pending_channel.items()):
+        if getattr(ch, "id", None) == thread.parent_id:
+            _pending_channel[sk] = thread
+            log.info(f"Thread redirect: {sk} → thread {thread.id} ({thread.name!r})")
+
+
+@client.event
 async def on_message(message: discord.Message):
     if message.author == client.user:
         return
@@ -270,7 +286,9 @@ async def on_message(message: discord.Message):
         return
 
     # ignore if someone/some role is mentioned but not the bot
-    if (message.mentions or message.role_mentions) and client.user not in message.mentions:
+    # exception: trusted users (in ALLOWED_USER_IDS) may mention anyone freely
+    is_trusted = bool(ALLOWED_USER_IDS) and message.author.id in ALLOWED_USER_IDS
+    if not is_trusted and (message.mentions or message.role_mentions) and client.user not in message.mentions:
         return
 
     # rate limit
@@ -321,8 +339,15 @@ async def on_message(message: discord.Message):
     _pending_texts[session_key].append(content)
     if session_key in _pending:
         _pending[session_key].cancel()
+    immediate = bool(STREAM_END_SIGNAL) and STREAM_END_SIGNAL in content
+    if immediate:
+        _pending_texts[session_key][-1] = (
+            _pending_texts[session_key][-1].replace(STREAM_END_SIGNAL, "").rstrip()
+        )
+        log.info(f"STREAM_END detected for {session_key}, flushing immediately")
+    _pending_channel[session_key] = message.channel
     task = asyncio.create_task(
-        _flush(session_key, message.channel, message.author, message.author.bot)
+        _flush(session_key, message.channel, message.author, message.author.bot, immediate)
     )
     _pending[session_key] = task
 
