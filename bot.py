@@ -45,11 +45,17 @@ ALLOWED_USER_IDS: set[int] = {
 }
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
+# Extra args prepended to every CLAUDE_BIN call.
+# Claude Code default: --dangerously-skip-permissions
+# OpenAI adapter: leave empty or set --model gpt-4o
+CLAUDE_EXTRA_ARGS: list[str] = [
+    a for a in os.getenv("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions").split() if a
+]
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "2.5"))
-STREAM_END_SIGNAL = os.getenv("STREAM_END_SIGNAL", "[STREAM_END]")
+STREAM_HOLD_SIGNAL = os.getenv("STREAM_HOLD_SIGNAL", "[未完]")
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
@@ -148,7 +154,7 @@ async def run_claude(prompt: str, session_key: str) -> str:
     if not session_id:
         prompt = _DONE_INSTRUCTION + prompt
 
-    args = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+    args = [CLAUDE_BIN] + CLAUDE_EXTRA_ARGS
     if session_id:
         args += ["--resume", session_id]
     args += ["--print", "--output-format", "json", "--", prompt]
@@ -192,10 +198,9 @@ async def _flush(
     channel: discord.abc.Messageable,
     author: discord.abc.User,
     is_bot_author: bool,
-    immediate: bool = False,
 ) -> None:
     """Debounce timer: fires after DEBOUNCE_SECONDS of silence, sends combined prompt."""
-    await asyncio.sleep(0 if immediate else DEBOUNCE_SECONDS)
+    await asyncio.sleep(DEBOUNCE_SECONDS)
     # Use thread-redirected channel if on_thread_create updated it
     channel = _pending_channel.pop(session_key, channel)  # type: ignore[assignment]
 
@@ -339,15 +344,20 @@ async def on_message(message: discord.Message):
     _pending_texts[session_key].append(content)
     if session_key in _pending:
         _pending[session_key].cancel()
-    immediate = bool(STREAM_END_SIGNAL) and STREAM_END_SIGNAL in content
-    if immediate:
+
+    # [未完] on any chunk: buffer only, don't start flush timer, wait for next part
+    if STREAM_HOLD_SIGNAL and STREAM_HOLD_SIGNAL in content:
         _pending_texts[session_key][-1] = (
-            _pending_texts[session_key][-1].replace(STREAM_END_SIGNAL, "").rstrip()
+            _pending_texts[session_key][-1].replace(STREAM_HOLD_SIGNAL, "").rstrip()
         )
-        log.info(f"STREAM_END detected for {session_key}, flushing immediately")
+        _pending.pop(session_key, None)
+        _pending_channel[session_key] = message.channel
+        log.info(f"[未完] buffered chunk for {session_key}, waiting for next part")
+        return
+
     _pending_channel[session_key] = message.channel
     task = asyncio.create_task(
-        _flush(session_key, message.channel, message.author, message.author.bot, immediate)
+        _flush(session_key, message.channel, message.author, message.author.bot)
     )
     _pending[session_key] = task
 
