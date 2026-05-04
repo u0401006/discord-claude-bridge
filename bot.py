@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -243,12 +244,30 @@ async def _flush(
     elif current_turn == MAX_TURNS:
         reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
-    log.info(f"Response length: {len(reply)} chars")
+    # Extract [SEND_FILE:/path] tokens before sending
+    file_paths = re.findall(r'\[SEND_FILE:([^\]]+)\]', reply)
+    reply = re.sub(r'\[SEND_FILE:[^\]]+\]', '', reply).strip()
+
+    log.info(f"Response length: {len(reply)} chars, files: {len(file_paths)}")
     mention = author.mention
-    chunks = chunk_text(reply)
-    for i, chunk in enumerate(chunks):
-        text = f"{mention} {chunk}" if i == 0 else chunk
-        await channel.send(text)  # type: ignore[union-attr]
+    if reply:
+        chunks = chunk_text(reply)
+        for i, chunk in enumerate(chunks):
+            text = f"{mention} {chunk}" if i == 0 else chunk
+            await channel.send(text)  # type: ignore[union-attr]
+        for path in file_paths:
+            try:
+                await channel.send(file=discord.File(path.strip()))  # type: ignore[union-attr]
+            except Exception as e:
+                await channel.send(f"[檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
+    else:
+        for i, path in enumerate(file_paths):
+            try:
+                content = mention if i == 0 else None
+                await channel.send(content=content, file=discord.File(path.strip()))  # type: ignore[union-attr]
+            except Exception as e:
+                pfx = mention if i == 0 else ""
+                await channel.send(f"{pfx} [檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
 
 
 # ── event handlers ────────────────────────────────────────────────────────────
