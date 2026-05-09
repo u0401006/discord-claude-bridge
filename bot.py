@@ -44,6 +44,12 @@ ALLOWED_CHANNEL_IDS: set[int] = {
 ALLOWED_USER_IDS: set[int] = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
 }
+BLOCKED_CHANNEL_IDS: set[int] = {
+    int(x) for x in os.getenv("BLOCKED_CHANNEL_IDS", "").split(",") if x.strip()
+}
+BLOCKED_USER_IDS: set[int] = {
+    int(x) for x in os.getenv("BLOCKED_USER_IDS", "").split(",") if x.strip()
+}
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 # Extra args prepended to every CLAUDE_BIN call.
@@ -61,6 +67,7 @@ DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
 SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
+MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
 
 # rate limiter: user_id → list of timestamps
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
@@ -175,6 +182,11 @@ async def run_claude(prompt: str, session_key: str) -> str:
 
         if proc.returncode != 0:
             err = stderr.decode().strip()
+            # 失效 session：清除舊 ID 並重試一次（不帶 --resume）
+            if session_id and "No conversation found" in err:
+                _sessions.pop(session_key, None)
+                _save_sessions()
+                return await run_claude(prompt, session_key)
             return f"```\nError (exit {proc.returncode}):\n{err[:1800]}\n```"
 
         raw = stdout.decode().strip()
@@ -235,7 +247,7 @@ async def _flush(
         _stopped_sessions.add(session_key)
         log.info(f"Claude signaled [DONE] for {session_key}")
         if not is_bot_author:
-            reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或輸入 `!reset` 開啟新 session。"
+            reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或以 `!flush` 加入記憶，以 `!reset` 開啟新 session。"
     elif is_bot_author and _is_punct_only(reply):
         # Claude returned pure punctuation in a bot-to-bot turn → auto-stop to break loop
         _stopped_sessions.add(session_key)
@@ -277,6 +289,8 @@ async def on_ready():
     log.info(f"Logged in as {client.user}")
     log.info(f"Allowed channels: {ALLOWED_CHANNEL_IDS or 'ALL (danger!)'}")
     log.info(f"Allowed users:   {ALLOWED_USER_IDS or 'ALL (danger!)'}")
+    log.info(f"Blocked channels: {BLOCKED_CHANNEL_IDS or 'none'}")
+    log.info(f"Blocked users:   {BLOCKED_USER_IDS or 'none'}")
     log.info(f"Working dir:     {WORKING_DIR}")
 
 
@@ -298,13 +312,17 @@ async def on_message(message: discord.Message):
     if message.type not in (discord.MessageType.default, discord.MessageType.reply):
         return
 
-    # channel guard: support threads by checking parent_id against ALLOWED_CHANNEL_IDS
-    if ALLOWED_CHANNEL_IDS:
-        ch_id = getattr(message.channel, "parent_id", None) or message.channel.id
-        if ch_id not in ALLOWED_CHANNEL_IDS:
-            return
+    # channel guard: support threads by checking parent_id against ALLOWED/BLOCKED lists
+    ch_id = getattr(message.channel, "parent_id", None) or message.channel.id
+    if BLOCKED_CHANNEL_IDS and ch_id in BLOCKED_CHANNEL_IDS:
+        return
+    if ALLOWED_CHANNEL_IDS and ch_id not in ALLOWED_CHANNEL_IDS:
+        return
 
     # user guard
+    if BLOCKED_USER_IDS and message.author.id in BLOCKED_USER_IDS:
+        log.warning(f"Blocked user {message.author} ({message.author.id})")
+        return
     if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
         log.warning(f"Blocked user {message.author} ({message.author.id})")
         return
@@ -347,7 +365,31 @@ async def on_message(message: discord.Message):
         _pending_texts.pop(session_key, None)
         _stopped_sessions.add(session_key)
         log.info(f"Session force-stopped for {session_key}")
-        await message.channel.send("Session stopped. 輸入 `!reset` 開啟新 session。")
+        await message.channel.send("Session stopped. 輸入 `!flush` 存入記憶，或 `!reset` 開啟新 session。")
+        return
+
+    if content == "!flush":
+        session_id = _sessions.get(session_key)
+        if not session_id:
+            await message.channel.send("沒有可 flush 的 session。")
+            return
+        await message.channel.send("正在壓縮對話記憶…")
+        summary_prompt = (
+            "請將本次對話的關鍵 findings、決策與結論，濃縮成 300 字以內的 Markdown 摘要，"
+            "供後續 agent 在同一 thread 繼續工作時參考。只輸出摘要本文，不加任何說明或前言。"
+        )
+        async with message.channel.typing():
+            summary = await run_claude(summary_prompt, session_key)
+        ch_id = str(getattr(message.channel, "parent_id", None) or message.channel.id)
+        thread_id = str(message.channel.id)
+        memory_dir = os.path.join(MEMORY_DIR, ch_id, thread_id)
+        os.makedirs(memory_dir, exist_ok=True)
+        memory_path = os.path.join(memory_dir, "context.md")
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(memory_path, "a", encoding="utf-8") as f:
+            f.write(f"\n\n---\n<!-- flushed at {timestamp} by {message.author} -->\n\n{summary}\n")
+        log.info(f"Flushed session context for {session_key} → {memory_path}")
+        await message.channel.send(f"已存入 `{memory_path}`")
         return
 
     # silent ack: known ack tokens OR any all-punctuation message from a bot
