@@ -266,6 +266,8 @@ async def _flush(
         chunks = chunk_text(reply)
         for i, chunk in enumerate(chunks):
             text = f"{mention} {chunk}" if i == 0 else chunk
+            if i < len(chunks) - 1 and STREAM_HOLD_SIGNAL:
+                text = text.rstrip() + f"\n{STREAM_HOLD_SIGNAL}"
             await channel.send(text)  # type: ignore[union-attr]
         for path in file_paths:
             try:
