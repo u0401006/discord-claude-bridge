@@ -102,11 +102,37 @@ def _is_punct_only(text: str) -> bool:
     )
 
 # system instruction injected once at the start of every new session
-_DONE_INSTRUCTION = (
-    "[System: When you consider this conversation complete or the task fully done, "
-    f"append exactly `{_DONE_SIGNAL}` on its own line at the very end of your response. "
-    "The bridge will then stop forwarding further bot messages to you.]\n\n"
-)
+def _make_session_instruction(session_key: str) -> str:
+    """Build system instructions for a new Claude session (B3: memory hint, B2: discord-context)."""
+    # Extract channel_id from session_key format: ch{channel_id}_u{user_id}
+    channel_id = ""
+    if session_key.startswith("ch") and "_u" in session_key:
+        channel_id = session_key[2:].split("_u")[0]
+
+    done_rule = (
+        f"[System: When you consider this conversation complete or the task fully done, "
+        f"append exactly `{_DONE_SIGNAL}` on its own line at the very end of your response. "
+        "The bridge will then stop forwarding further bot messages to you.]"
+    )
+
+    # B3: instruct Claude to read memory files at session start
+    memory_hint = (
+        "[System: This is a new session. Before responding to the first task, "
+        "read your MEMORY.md index, then Read any memory files relevant to the request.]"
+    )
+
+    parts = [done_rule, memory_hint]
+
+    # B2: inject channel_id so Claude can restore Discord thread context via skill
+    if channel_id:
+        ctx_hint = (
+            f"[System: This is a Discord bridge session (channel {channel_id}). "
+            "If the task references prior discussions you lack context for, restore it first:\n"
+            f"python3 ~/.claude/skills/discord-context/scripts/fetch_thread.py {channel_id}]"
+        )
+        parts.append(ctx_hint)
+
+    return "\n\n".join(parts) + "\n\n"
 
 
 def _load_sessions() -> dict[str, str]:
@@ -160,7 +186,7 @@ async def run_claude(prompt: str, session_key: str) -> str:
 
     # Inject exit-signal instruction once on the first turn of a new session
     if not session_id:
-        prompt = _DONE_INSTRUCTION + prompt
+        prompt = _make_session_instruction(session_key) + prompt
 
     args = [CLAUDE_BIN] + CLAUDE_EXTRA_ARGS
     if session_id:
