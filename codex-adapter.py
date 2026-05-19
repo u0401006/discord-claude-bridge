@@ -155,9 +155,9 @@ def run_codex(prompt: str, model: str, resume_id: str | None = None) -> tuple[st
     ]
 
     if resume_id:
-        cmd = base_flags + ["resume", resume_id, prompt]
+        cmd = base_flags + ["resume", resume_id, "--", prompt]
     else:
-        cmd = base_flags + [prompt]
+        cmd = base_flags + ["--", prompt]
 
     try:
         result = subprocess.run(

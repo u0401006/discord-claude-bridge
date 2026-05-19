@@ -273,7 +273,7 @@ async def _flush(
             try:
                 await channel.send(file=discord.File(path.strip()))  # type: ignore[union-attr]
             except Exception as e:
-                await channel.send(f"[檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
+                await channel.send(f"{author.mention} [檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
     else:
         for i, path in enumerate(file_paths):
             try:
@@ -337,7 +337,7 @@ async def on_message(message: discord.Message):
 
     # rate limit
     if is_rate_limited(message.author.id):
-        await message.channel.send(f"Rate limit: max {RATE_LIMIT_PER_MIN} requests/min.")
+        await message.channel.send(f"{message.author.mention} Rate limit: max {RATE_LIMIT_PER_MIN} requests/min.")
         return
 
     content = message.content.strip()
@@ -358,7 +358,7 @@ async def on_message(message: discord.Message):
         _stopped_sessions.discard(session_key)
         _save_sessions()
         log.info(f"Session reset for {session_key}")
-        await message.channel.send("Session cleared.")
+        await message.channel.send(f"{message.author.mention} Session cleared.")
         return
 
     if content == "!stop":
@@ -367,15 +367,15 @@ async def on_message(message: discord.Message):
         _pending_texts.pop(session_key, None)
         _stopped_sessions.add(session_key)
         log.info(f"Session force-stopped for {session_key}")
-        await message.channel.send("Session stopped. 輸入 `!flush` 存入記憶，或 `!reset` 開啟新 session。")
+        await message.channel.send(f"{message.author.mention} Session stopped. 輸入 `!flush` 存入記憶，或 `!reset` 開啟新 session。")
         return
 
     if content == "!flush":
         session_id = _sessions.get(session_key)
         if not session_id:
-            await message.channel.send("沒有可 flush 的 session。")
+            await message.channel.send(f"{message.author.mention} 沒有可 flush 的 session。")
             return
-        await message.channel.send("正在壓縮對話記憶…")
+        await message.channel.send(f"{message.author.mention} 正在壓縮對話記憶…")
         summary_prompt = (
             "請將本次對話的關鍵 findings、決策與結論，濃縮成 300 字以內的 Markdown 摘要，"
             "供後續 agent 在同一 thread 繼續工作時參考。只輸出摘要本文，不加任何說明或前言。"
@@ -391,7 +391,7 @@ async def on_message(message: discord.Message):
         with open(memory_path, "a", encoding="utf-8") as f:
             f.write(f"\n\n---\n<!-- flushed at {timestamp} by {message.author} -->\n\n{summary}\n")
         log.info(f"Flushed session context for {session_key} → {memory_path}")
-        await message.channel.send(f"已存入 `{memory_path}`")
+        await message.channel.send(f"{message.author.mention} 已存入 `{memory_path}`")
         return
 
     # silent ack: known ack tokens OR any all-punctuation message from a bot
