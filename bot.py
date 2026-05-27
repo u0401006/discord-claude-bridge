@@ -2,6 +2,7 @@
 Discord ↔ Claude Code Bridge
 每則訊息透過 `claude --print` subprocess 送進 Claude Code，結果回傳 Discord。
 """
+from __future__ import annotations
 
 import asyncio
 import json
