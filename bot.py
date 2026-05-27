@@ -65,6 +65,23 @@ DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "2.5"))
 STREAM_HOLD_SIGNAL = os.getenv("STREAM_HOLD_SIGNAL", "[未完]")
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
 
+# SEND_FILE: colon-separated list of allowed base dirs (realpath).  Default: WORKING_DIR only.
+# Set SEND_FILE_ALLOWED_DIRS=/path/a:/path/b to expand. Empty = use WORKING_DIR.
+_SEND_FILE_DIRS: list[str] = [
+    os.path.realpath(os.path.expanduser(d))
+    for d in os.getenv("SEND_FILE_ALLOWED_DIRS", "").split(":")
+    if d.strip()
+]
+# Comma-separated allowed extensions (including leading dot).
+_SEND_FILE_EXTS: frozenset[str] = frozenset(
+    e.strip().lower()
+    for e in os.getenv(
+        "SEND_FILE_ALLOWED_EXTS",
+        ".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.csv,.json,.md,.log",
+    ).split(",")
+    if e.strip()
+)
+
 _LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
 SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
 MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
@@ -72,11 +89,8 @@ MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
 # rate limiter: user_id → list of timestamps
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
 
-# turn counter: session_key → number of turns used (in-memory, resets on bot restart)
+# turn counter / stopped sessions — initialized from disk below (see _load_sessions)
 _turn_counts: dict[str, int] = defaultdict(int)
-
-# stopped sessions: force-stopped by !stop or Claude's [DONE] signal (in-memory)
-# only blocks bot messages; humans can still continue
 _stopped_sessions: set[str] = set()
 
 # debounce: buffer incoming messages, cancel+restart timer on each new message
@@ -135,22 +149,42 @@ def _make_session_instruction(session_key: str) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
-def _load_sessions() -> dict[str, str]:
+def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str]]:
     try:
         with open(SESSIONS_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict) and "sessions" in data:
+            # New envelope format
+            sessions = data["sessions"]
+            turn_counts = {k: int(v) for k, v in data.get("turn_counts", {}).items()}
+            stopped = set(data.get("stopped_sessions", []))
+        else:
+            # Legacy format: plain {session_key: session_id}
+            sessions = data
+            turn_counts = {}
+            stopped = set()
+        return sessions, turn_counts, stopped
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        return {}, {}, set()
 
 
 def _save_sessions() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(SESSIONS_FILE)), exist_ok=True)
+    data = {
+        "sessions": _sessions,
+        "turn_counts": dict(_turn_counts),
+        "stopped_sessions": list(_stopped_sessions),
+    }
     with open(SESSIONS_FILE, "w") as f:
-        json.dump(_sessions, f)
+        json.dump(data, f)
 
 
-# session tracker: session_key → claude session_id (persisted across restarts)
-_sessions: dict[str, str] = _load_sessions()
+# session tracker — all three dicts persisted together across restarts
+_sessions, _tc, _ss = _load_sessions()
+_sessions: dict[str, str] = _sessions          # type: ignore[no-redef]
+_turn_counts = defaultdict(int, _tc)
+_stopped_sessions: set[str] = _ss
+del _tc, _ss
 
 
 def is_rate_limited(user_id: int) -> bool:
@@ -170,15 +204,75 @@ client = discord.Client(intents=intents)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _scan_fence(text: str) -> str | None:
+    """Return the currently-open fence lang (empty str for plain ```), or None if closed."""
+    state: str | None = None
+    for line in text.splitlines():
+        m = re.match(r"^```(\w*)$", line.rstrip())
+        if m:
+            state = None if state is not None else m.group(1)
+    return state
+
+
 def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
-    """Split long text into Discord-safe chunks, respecting code blocks."""
+    """Split text into Discord-safe chunks, closing/reopening code fences at boundaries."""
     if len(text) <= limit:
         return [text]
-    chunks = []
-    while text:
-        chunks.append(text[:limit])
-        text = text[limit:]
+
+    chunks: list[str] = []
+    remaining = text
+    reopen = ""  # fence re-open header to prepend to next chunk
+
+    while remaining:
+        work = reopen + remaining
+        reopen = ""
+
+        if len(work) <= limit:
+            chunks.append(work)
+            break
+
+        # Leave 4 chars headroom for potential "\n```" close suffix
+        budget = limit - 4
+        nl = work.rfind("\n", 0, budget)
+        cut = nl if nl > budget // 2 else budget  # prefer newline; hard-cut for long lines
+
+        head = work[:cut]
+        remaining = work[cut:].lstrip("\n")
+
+        fence = _scan_fence(head)
+        if fence is not None:
+            head += "\n```"
+            reopen = f"```{fence}\n"
+
+        chunks.append(head)
+
     return chunks
+
+
+def _validate_send_file(path: str) -> str | None:
+    """Return realpath if the file is in an allowed dir with an allowed extension; else None."""
+    try:
+        real = os.path.realpath(os.path.expanduser(path.strip()))
+    except Exception:
+        return None
+
+    allowed_dirs = _SEND_FILE_DIRS or [os.path.realpath(WORKING_DIR)]
+    if not any(
+        real == d or real.startswith(d + os.sep) for d in allowed_dirs
+    ):
+        log.warning("SEND_FILE rejected (outside allowed dirs): %r", path)
+        return None
+
+    _, ext = os.path.splitext(real)
+    if _SEND_FILE_EXTS and ext.lower() not in _SEND_FILE_EXTS:
+        log.warning("SEND_FILE rejected (extension not allowed): %r", path)
+        return None
+
+    if not os.path.isfile(real):
+        log.warning("SEND_FILE rejected (not a regular file): %r", path)
+        return None
+
+    return real
 
 
 async def run_claude(prompt: str, session_key: str) -> str:
@@ -271,20 +365,29 @@ async def _flush(
     if _DONE_SIGNAL in reply:
         reply = reply.replace(_DONE_SIGNAL, "").rstrip()
         _stopped_sessions.add(session_key)
+        _save_sessions()
         log.info(f"Claude signaled [DONE] for {session_key}")
         if not is_bot_author:
             reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或以 `!flush` 加入記憶，以 `!reset` 開啟新 session。"
     elif is_bot_author and _is_punct_only(reply):
         # Claude returned pure punctuation in a bot-to-bot turn → auto-stop to break loop
         _stopped_sessions.add(session_key)
+        _save_sessions()
         log.info(f"Claude punct-only reply in bot session, auto-stop for {session_key}")
         return  # send nothing; silence breaks the ping-pong
     elif current_turn == MAX_TURNS:
         reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
-    # Extract [SEND_FILE:/path] tokens before sending
-    file_paths = re.findall(r'\[SEND_FILE:([^\]]+)\]', reply)
+    # Extract [SEND_FILE:/path] tokens before sending; validate each path
+    raw_paths = re.findall(r'\[SEND_FILE:([^\]]+)\]', reply)
     reply = re.sub(r'\[SEND_FILE:[^\]]+\]', '', reply).strip()
+    file_paths: list[str] = []
+    for rp in raw_paths:
+        safe = _validate_send_file(rp)
+        if safe:
+            file_paths.append(safe)
+        else:
+            log.warning("SEND_FILE path rejected, skipping: %r", rp)
 
     log.info(f"Response length: {len(reply)} chars, files: {len(file_paths)}")
     mention = author.mention
@@ -297,17 +400,17 @@ async def _flush(
             await channel.send(text)  # type: ignore[union-attr]
         for path in file_paths:
             try:
-                await channel.send(file=discord.File(path.strip()))  # type: ignore[union-attr]
+                await channel.send(file=discord.File(path))  # type: ignore[union-attr]
             except Exception as e:
-                await channel.send(f"{author.mention} [檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
+                await channel.send(f"{author.mention} [檔案傳送失敗: {path}] {e}")  # type: ignore[union-attr]
     else:
         for i, path in enumerate(file_paths):
             try:
                 content = mention if i == 0 else None
-                await channel.send(content=content, file=discord.File(path.strip()))  # type: ignore[union-attr]
+                await channel.send(content=content, file=discord.File(path))  # type: ignore[union-attr]
             except Exception as e:
                 pfx = mention if i == 0 else ""
-                await channel.send(f"{pfx} [檔案傳送失敗: {path.strip()}] {e}")  # type: ignore[union-attr]
+                await channel.send(f"{pfx} [檔案傳送失敗: {path}] {e}")  # type: ignore[union-attr]
 
 
 # ── event handlers ────────────────────────────────────────────────────────────
@@ -367,6 +470,29 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
+
+    # Handle .txt file attachments: download and append content to prompt
+    txt_attachments = [a for a in message.attachments if a.filename.lower().endswith('.txt')]
+    if txt_attachments:
+        import tempfile, aiohttp
+        attachment_texts = []
+        for att in txt_attachments:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(att.url) as resp:
+                        raw = await resp.read()
+                        text = raw.decode('utf-8', errors='replace')
+                        # Save to /tmp so Claude can reference by path if needed
+                        tmp_path = f"/tmp/discord_attach_{att.filename}"
+                        with open(tmp_path, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                        attachment_texts.append(
+                            f"\n\n[附件：{att.filename}，已存至 {tmp_path}]\n{text}"
+                        )
+            except Exception as e:
+                attachment_texts.append(f"\n\n[附件 {att.filename} 讀取失敗：{e}]")
+        content = content + "".join(attachment_texts)
+
     if not content:
         return
 
@@ -392,6 +518,7 @@ async def on_message(message: discord.Message):
             _pending.pop(session_key).cancel()
         _pending_texts.pop(session_key, None)
         _stopped_sessions.add(session_key)
+        _save_sessions()
         log.info(f"Session force-stopped for {session_key}")
         await message.channel.send(f"{message.author.mention} Session stopped. 輸入 `!flush` 存入記憶，或 `!reset` 開啟新 session。")
         return

@@ -6,3 +6,8 @@
 logs/
 .cursor/
 editor-soul.md
+__pycache__/
+*.pyc
+*.pyo
+sessions.json
+memory/
