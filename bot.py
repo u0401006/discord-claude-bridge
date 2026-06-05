@@ -104,6 +104,137 @@ _pending_channel: dict[str, discord.abc.Messageable] = {}
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
 
+# per-session model override: session_key → model name
+_session_model: dict[str, str] = {}
+
+# ── CLI command mapping ──────────────────────────────────────────────────────
+# Each entry: "!cmd" → {"prefix": str, "args": list[str], "help": str}
+# - prefix: prepended to the user prompt (system-style instruction)
+# - args: extra CLI flags added to the claude invocation
+# - help: shown in !help output
+# Commands that take remaining text as <task>; standalone commands return immediately.
+
+_CMD_MAP: dict[str, dict] = {
+    "!plan": {
+        "prefix": (
+            "[Mode: Plan] 在動手寫任何程式碼之前，先產出結構化的實作計畫：\n"
+            "1. 目標確認\n2. 子任務拆解（含檔案路徑）\n3. 風險與邊界條件\n4. 驗收標準\n"
+            "計畫完成後停下，等使用者確認才執行。\n\n"
+        ),
+        "args": [],
+        "help": "!plan <task> — 先規劃再執行，等確認後才動手",
+    },
+    "!think": {
+        "prefix": (
+            "[Mode: Deep Think] 這個問題需要深度思考。\n"
+            "請先花時間分析問題的各個面向、可能的方案與 trade-offs，"
+            "再給出你的結論和建議。不急著給答案，品質優先。\n\n"
+        ),
+        "args": [],
+        "help": "!think <task> — 深度思考模式，分析各面向再給結論",
+    },
+    "!review": {
+        "prefix": (
+            "[Mode: Code Review] 請對以下程式碼或變更進行 code review：\n"
+            "- 指出 bug、安全風險、效能問題\n"
+            "- 建議改善方向\n"
+            "- 標明嚴重程度 (critical / warning / suggestion)\n\n"
+        ),
+        "args": [],
+        "help": "!review <code or file> — Code review 模式",
+    },
+    "!debug": {
+        "prefix": (
+            "[Mode: Systematic Debug] 請用系統化方式除錯：\n"
+            "1. 重現問題（確認症狀）\n2. 建立假設\n3. 驗證假設（讀 code / 跑測試）\n"
+            "4. 找到 root cause\n5. 修復並驗證\n"
+            "每一步都回報你的發現。\n\n"
+        ),
+        "args": [],
+        "help": "!debug <問題描述> — 系統化除錯流程",
+    },
+    "!quick": {
+        "prefix": (
+            "[Mode: Quick] 直接執行，不需要解釋過程。"
+            "只回覆結果和必要的 before/after 對比。\n\n"
+        ),
+        "args": [],
+        "help": "!quick <task> — 快速執行，省略解釋",
+    },
+    "!summarize": {
+        "prefix": (
+            "[Mode: Summarize] 請用繁體中文、中央社風格，將以下內容濃縮為 100 字以內摘要。"
+            "只輸出摘要本文。\n\n"
+        ),
+        "args": [],
+        "help": "!summarize <內容> — 中央社風格 100 字摘要",
+    },
+}
+
+# Direct CLI commands: these bypass run_claude and call claude subcommands directly.
+# "!discord_cmd" → {"cli": ["subcommand", ...], "help": str}
+_DIRECT_CMD_MAP: dict[str, dict] = {
+    "!ultrareview": {
+        "cli": ["ultrareview"],
+        "help": "!ultrareview [PR號 or branch] — 多 agent code review（cloud-hosted）",
+    },
+    "!ultrawork": {
+        "cli": ["ultrawork"],
+        "help": "!ultrawork <task> — 多 agent 並行拆解任務（需 Workflows flag）",
+    },
+    "!ultracode": {
+        "cli": ["ultracode"],
+        "help": "!ultracode <task> — 多 agent 並行寫 code（需 Workflows flag）",
+    },
+}
+
+# model aliases for !model command
+_MODEL_ALIASES: dict[str, str] = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+
+async def _run_direct_cmd(
+    cmd_args: list[str], timeout: int = 600
+) -> str:
+    """Run a claude subcommand directly (not --print). Returns stdout or error."""
+    args = [CLAUDE_BIN] + cmd_args
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=WORKING_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return f"Timeout after {timeout}s"
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            return f"```\nError (exit {proc.returncode}):\n{err[:1800]}\n```"
+        return stdout.decode().strip() or "(no output)"
+    except Exception as e:
+        return f"Bridge error: {e}"
+
+
+def _parse_command(content: str) -> tuple[str, list[str]]:
+    """Parse !cmd from content. Returns (modified_content, extra_cli_args).
+
+    If content starts with a mapped !cmd, prepend its prefix and collect extra args.
+    """
+    extra_args: list[str] = []
+    for cmd, spec in _CMD_MAP.items():
+        if content == cmd or content.startswith(cmd + " "):
+            task = content[len(cmd):].strip()
+            prefix = spec["prefix"]
+            extra_args = list(spec["args"])
+            return prefix + task, extra_args
+    return content, extra_args
+
 # silent-ack patterns: any message whose stripped content matches one of these
 # is dropped without calling Claude (covers ASCII and CJK punctuation)
 _ACK_CONTENT: frozenset[str] = frozenset({".", "。", "·", "…", "...", "、"})
@@ -276,7 +407,9 @@ def _validate_send_file(path: str) -> str | None:
     return real
 
 
-async def run_claude(prompt: str, session_key: str) -> str:
+async def run_claude(
+    prompt: str, session_key: str, extra_args: list[str] | None = None
+) -> str:
     session_id = _sessions.get(session_key)
 
     # Inject exit-signal instruction once on the first turn of a new session
@@ -284,6 +417,12 @@ async def run_claude(prompt: str, session_key: str) -> str:
         prompt = _make_session_instruction(session_key) + prompt
 
     args = [CLAUDE_BIN] + CLAUDE_EXTRA_ARGS
+    # per-session model override
+    model = _session_model.get(session_key)
+    if model:
+        args += ["--model", model]
+    if extra_args:
+        args += extra_args
     if session_id:
         args += ["--resume", session_id]
     args += ["--print", "--output-format", "json", "--", prompt]
@@ -308,7 +447,23 @@ async def run_claude(prompt: str, session_key: str) -> str:
                 _sessions.pop(session_key, None)
                 _save_sessions()
                 return await run_claude(prompt, session_key)
-            return f"```\nError (exit {proc.returncode}):\n{err[:1800]}\n```"
+            # Claude CLI outputs errors as JSON to stdout (not stderr) on some failures
+            raw_out = stdout.decode().strip()
+            human_reason = ""
+            if raw_out:
+                try:
+                    out_data = json.loads(raw_out)
+                    result_msg = out_data.get("result", "")
+                    api_status = out_data.get("api_error_status")
+                    if api_status == 429 or "session limit" in result_msg.lower():
+                        human_reason = f"Claude session limit 已達上限。{result_msg}"
+                    elif result_msg:
+                        human_reason = result_msg
+                except json.JSONDecodeError:
+                    human_reason = raw_out[:500]
+            detail = human_reason or err or "(no detail)"
+            log.error(f"claude exit {proc.returncode}: {detail[:200]}")
+            return f"```\nError (exit {proc.returncode}):\n{detail[:1800]}\n```"
 
         raw = stdout.decode().strip()
         try:
@@ -348,6 +503,11 @@ async def _flush(
     if session_key in _stopped_sessions and is_bot_author:
         return
 
+    # parse !cmd prefixes from the first line (human messages only)
+    extra_args: list[str] = []
+    if not is_bot_author:
+        combined, extra_args = _parse_command(combined)
+
     _turn_counts[session_key] += 1
     current_turn = _turn_counts[session_key]
 
@@ -360,7 +520,7 @@ async def _flush(
     )
 
     async with channel.typing():  # type: ignore[arg-type]
-        reply = await run_claude(combined, session_key)
+        reply = await run_claude(combined, session_key, extra_args=extra_args)
 
     # Detect Claude's self-exit signal
     if _DONE_SIGNAL in reply:
@@ -547,6 +707,64 @@ async def on_message(message: discord.Message):
         log.info(f"Flushed session context for {session_key} → {memory_path}")
         await message.channel.send(f"{message.author.mention} 已存入 `{memory_path}`")
         return
+
+    if content.startswith("!model"):
+        arg = content[len("!model"):].strip()
+        if not arg:
+            current = _session_model.get(session_key, "default")
+            aliases = ", ".join(f"`{k}` → `{v}`" for k, v in _MODEL_ALIASES.items())
+            await message.channel.send(
+                f"{message.author.mention} 目前模型：`{current}`\n"
+                f"用法：`!model <name>` — 可用別名：{aliases}\n"
+                "`!model reset` 恢復預設"
+            )
+            return
+        if arg == "reset":
+            _session_model.pop(session_key, None)
+            await message.channel.send(f"{message.author.mention} 已恢復預設模型。")
+            return
+        resolved = _MODEL_ALIASES.get(arg.lower(), arg)
+        _session_model[session_key] = resolved
+        await message.channel.send(f"{message.author.mention} 本 session 模型已切換為 `{resolved}`")
+        log.info(f"Model override for {session_key}: {resolved}")
+        return
+
+    if content == "!help":
+        lines = [
+            "**Discord ↔ Claude Bridge 指令**",
+            "",
+            "**Session 控制**",
+            "`!reset` — 清除 session，重新開始",
+            "`!stop` — 停止 Claude 回應（bot 訊息被擋下）",
+            "`!flush` — 壓縮對話記憶存檔",
+            "`!model <name>` — 切換模型（opus / sonnet / haiku）",
+            "",
+            "**工作模式**（`!cmd <task>`，後接任務內容）",
+        ]
+        for cmd, spec in _CMD_MAP.items():
+            lines.append(f"`{spec['help']}`")
+        lines.append("")
+        lines.append("**CLI 直通指令**")
+        for cmd, spec in _DIRECT_CMD_MAP.items():
+            lines.append(f"`{spec['help']}`")
+        lines.append("")
+        lines.append("`!help` — 顯示此說明")
+        await message.channel.send(f"{message.author.mention}\n" + "\n".join(lines))
+        return
+
+    # Direct CLI commands (ultrareview etc.) — run subcommand, not --print
+    for dcmd, dspec in _DIRECT_CMD_MAP.items():
+        if content == dcmd or content.startswith(dcmd + " "):
+            extra = content[len(dcmd):].strip().split() if content != dcmd else []
+            cli_args = list(dspec["cli"]) + extra
+            log.info(f"Direct CLI: {cli_args} from {message.author} ({message.author.id})")
+            await message.channel.send(f"{message.author.mention} 執行中：`claude {' '.join(cli_args)}`（可能需要數分鐘）")
+            async with message.channel.typing():
+                result = await _run_direct_cmd(cli_args)
+            chunks = chunk_text(result)
+            for chunk in chunks:
+                await message.channel.send(chunk)
+            return
 
     # silent ack: known ack tokens OR any all-punctuation message from a bot
     if content in _ACK_CONTENT or (message.author.bot and _is_punct_only(content)):
