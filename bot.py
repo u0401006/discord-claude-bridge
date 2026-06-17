@@ -104,6 +104,9 @@ _pending_channel: dict[str, discord.abc.Messageable] = {}
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
 
+# marker for shared cross-bot task state posted in Discord threads
+_TASK_STATE_MARKER = "📋 [TASK STATE]"
+
 # per-session model override: session_key → model name
 _session_model: dict[str, str] = {}
 
@@ -381,6 +384,27 @@ def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
     return chunks
 
 
+async def fetch_task_state(channel: discord.abc.Messageable) -> str | None:
+    """Search recent 50 messages in channel for a TASK STATE marker. Returns full content or None."""
+    try:
+        async for msg in channel.history(limit=50):  # type: ignore[union-attr]
+            if msg.content.startswith(_TASK_STATE_MARKER):
+                return msg.content
+    except Exception as e:
+        log.warning(f"fetch_task_state failed: {e}")
+    return None
+
+
+async def write_task_state(channel: discord.abc.Messageable, bot_name: str, summary: str) -> None:
+    """Post a structured TASK STATE message to the channel."""
+    content = f"{_TASK_STATE_MARKER}\nupdated_by: {bot_name}\n\n{summary}"
+    try:
+        await channel.send(content[:1900])  # type: ignore[union-attr]
+        log.info(f"Task state written to channel by {bot_name}")
+    except Exception as e:
+        log.warning(f"write_task_state failed: {e}")
+
+
 def _validate_send_file(path: str) -> str | None:
     """Return realpath if the file is in an allowed dir with an allowed extension; else None."""
     try:
@@ -508,6 +532,14 @@ async def _flush(
     if not is_bot_author:
         combined, extra_args = _parse_command(combined)
 
+    # On new session: fetch shared task state from thread and prepend to prompt
+    is_new_session = session_key not in _sessions
+    if is_new_session:
+        task_state = await fetch_task_state(channel)
+        if task_state:
+            combined = f"[Shared task state from this thread]\n{task_state}\n\n[New message]\n{combined}"
+            log.info(f"Task state injected for new session {session_key}")
+
     _turn_counts[session_key] += 1
     current_turn = _turn_counts[session_key]
 
@@ -530,6 +562,18 @@ async def _flush(
         log.info(f"Claude signaled [DONE] for {session_key}")
         if not is_bot_author:
             reply += "\n\n---\n> Claude 已結束此對話。Bot 訊息將被擋下；你仍可繼續說話，或以 `!flush` 加入記憶，以 `!reset` 開啟新 session。"
+        # Write shared task state so other bots in this thread can pick up context
+        state_prompt = (
+            "請用以下 YAML 格式，產出本次對話的任務狀態摘要（100字以內）：\n"
+            "decided: <已決定的事項，若無填 none>\n"
+            "open_questions: <未決定的問題，若無填 none>\n"
+            "next_action: <下一步行動，若無填 none>\n"
+            "只輸出 YAML 內容，不加任何說明或 markdown 包裝。"
+        )
+        async with channel.typing():  # type: ignore[arg-type]
+            state_summary = await run_claude(state_prompt, session_key)
+        bot_name = str(client.user) if client.user else "bot"
+        await write_task_state(channel, bot_name, state_summary)
     elif is_bot_author and _is_punct_only(reply):
         # Claude returned pure punctuation in a bot-to-bot turn → auto-stop to break loop
         _stopped_sessions.add(session_key)
