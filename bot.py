@@ -676,6 +676,10 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
 
+    # silently drop task state announcements — bots read them via fetch_task_state(), not on_message
+    if content.startswith(_TASK_STATE_MARKER):
+        return
+
     # Handle .txt file attachments: download and append content to prompt
     txt_attachments = [a for a in message.attachments if a.filename.lower().endswith('.txt')]
     if txt_attachments:
