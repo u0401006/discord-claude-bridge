@@ -51,6 +51,11 @@ BLOCKED_CHANNEL_IDS: set[int] = {
 BLOCKED_USER_IDS: set[int] = {
     int(x) for x in os.getenv("BLOCKED_USER_IDS", "").split(",") if x.strip()
 }
+# Webhook/bot user IDs that bypass _stopped_sessions and auto-reset on each new task.
+# Add webhook user IDs here to allow task dispatchers to re-trigger Claude after [DONE].
+WEBHOOK_PASSTHROUGH_IDS: set[int] = {
+    int(x) for x in os.getenv("WEBHOOK_PASSTHROUGH_IDS", "").split(",") if x.strip()
+}
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 # Extra args prepended to every CLAUDE_BIN call.
@@ -821,7 +826,14 @@ async def on_message(message: discord.Message):
 
     # fast-path: [DONE] blocks further bot messages immediately, before debounce
     if session_key in _stopped_sessions and message.author.bot:
-        return
+        if message.author.id not in WEBHOOK_PASSTHROUGH_IDS:
+            return
+        # Whitelisted webhook: auto-reset stopped session so new tasks are processed fresh
+        _stopped_sessions.discard(session_key)
+        _sessions.pop(session_key, None)
+        _turn_counts.pop(session_key, None)
+        _save_sessions()
+        log.info(f"Webhook passthrough auto-reset for {session_key} (user {message.author.id})")
 
     # debounce: buffer content and restart sliding-window timer
     _pending_texts[session_key].append(content)
