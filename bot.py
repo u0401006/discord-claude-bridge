@@ -67,6 +67,7 @@ CLAUDE_EXTRA_ARGS: list[str] = [
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
+TASK_STATE_INTERVAL = int(os.getenv("TASK_STATE_INTERVAL", "5"))  # 0 = disabled
 DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "2.5"))
 STREAM_HOLD_SIGNAL = os.getenv("STREAM_HOLD_SIGNAL", "[未完]")
 DISCORD_CHUNK = 1900  # Discord limit is 2000; leave room for code fences
@@ -201,6 +202,7 @@ _MODEL_ALIASES: dict[str, str] = {
     "opus": "claude-opus-4-7",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
+    "fable": "claude-fable-5",
 }
 
 
@@ -389,15 +391,29 @@ def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
     return chunks
 
 
-async def fetch_task_state(channel: discord.abc.Messageable) -> str | None:
-    """Search recent 50 messages in channel for a TASK STATE marker. Returns full content or None."""
+def _should_write_interim_task_state(turn_count: int, interval: int) -> bool:
+    """Return True if an interim TASK STATE should be written at this turn."""
+    if interval <= 0 or turn_count <= 0:
+        return False
+    return turn_count % interval == 0
+
+
+async def fetch_task_state(channel: discord.abc.Messageable, max_merge: int = 3) -> str | None:
+    """Search recent 50 messages for TASK STATE markers; merge up to max_merge of them."""
+    found: list[str] = []
     try:
         async for msg in channel.history(limit=50):  # type: ignore[union-attr]
             if msg.content.startswith(_TASK_STATE_MARKER):
-                return msg.content
+                found.append(msg.content)
+                if len(found) >= max_merge:
+                    break
     except Exception as e:
         log.warning(f"fetch_task_state failed: {e}")
-    return None
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    return "\n\n---\n".join(found)
 
 
 async def write_task_state(channel: discord.abc.Messageable, bot_name: str, summary: str) -> None:
@@ -585,6 +601,20 @@ async def _flush(
         _save_sessions()
         log.info(f"Claude punct-only reply in bot session, auto-stop for {session_key}")
         return  # send nothing; silence breaks the ping-pong
+    elif _should_write_interim_task_state(current_turn, TASK_STATE_INTERVAL):
+        # Idea 3: write interim TASK STATE every N turns so other users get fresh context
+        state_prompt = (
+            "請用以下 YAML 格式，產出本次對話的任務狀態摘要（100字以內）：\n"
+            "decided: <已決定的事項，若無填 none>\n"
+            "open_questions: <未決定的問題，若無填 none>\n"
+            "next_action: <下一步行動，若無填 none>\n"
+            "只輸出 YAML 內容，不加任何說明或 markdown 包裝。"
+        )
+        async with channel.typing():  # type: ignore[arg-type]
+            state_summary = await run_claude(state_prompt, session_key)
+        bot_name = str(client.user) if client.user else "bot"
+        await write_task_state(channel, bot_name, state_summary)
+        log.info(f"Interim task state written at turn {current_turn} for {session_key}")
     elif current_turn == MAX_TURNS:
         reply += f"\n\n---\n> 本對話已達上限 {MAX_TURNS} 輪，請輸入 `!reset` 重啟新的 session。"
 
@@ -685,33 +715,39 @@ async def on_message(message: discord.Message):
     if content.startswith(_TASK_STATE_MARKER):
         return
 
-    # Handle .txt file attachments: download and append content to prompt
-    txt_attachments = [a for a in message.attachments if a.filename.lower().endswith('.txt')]
-    if txt_attachments:
-        import tempfile, aiohttp
-        attachment_texts = []
-        for att in txt_attachments:
+    # Handle file attachments: download and save to /tmp; append text content for .txt files
+    IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    TEXT_EXTS  = {'.txt'}
+    attachment_texts = []
+    if message.attachments:
+        import aiohttp
+        for att in message.attachments:
+            ext = '.' + att.filename.rsplit('.', 1)[-1].lower() if '.' in att.filename else ''
+            tmp_path = f"/tmp/discord_attach_{att.filename}"
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(att.url) as resp:
+                async with aiohttp.ClientSession() as http:
+                    async with http.get(att.url) as resp:
                         raw = await resp.read()
-                        text = raw.decode('utf-8', errors='replace')
-                        # Save to /tmp so Claude can reference by path if needed
-                        tmp_path = f"/tmp/discord_attach_{att.filename}"
-                        with open(tmp_path, 'w', encoding='utf-8') as f:
-                            f.write(text)
-                        attachment_texts.append(
-                            f"\n\n[附件：{att.filename}，已存至 {tmp_path}]\n{text}"
-                        )
+                        with open(tmp_path, 'wb') as f:
+                            f.write(raw)
+                if ext in IMAGE_EXTS:
+                    attachment_texts.append(f"\n\n[圖片附件：{att.filename}，已存至 {tmp_path}]")
+                elif ext in TEXT_EXTS:
+                    text = raw.decode('utf-8', errors='replace')
+                    attachment_texts.append(
+                        f"\n\n[附件：{att.filename}，已存至 {tmp_path}]\n{text}"
+                    )
+                else:
+                    attachment_texts.append(f"\n\n[附件：{att.filename}，已存至 {tmp_path}]")
             except Exception as e:
                 attachment_texts.append(f"\n\n[附件 {att.filename} 讀取失敗：{e}]")
+    if attachment_texts:
         content = content + "".join(attachment_texts)
 
     if not content:
         return
 
-    if client.user and content.startswith(f"<@{client.user.id}>"):
-        content = content[len(f"<@{client.user.id}>"):].strip()
+    content = re.sub(r'^(<@!?\d+>\s*)+', '', content).strip()
 
     session_key = f"ch{message.channel.id}_u{message.author.id}"
 
