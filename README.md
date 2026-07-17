@@ -14,6 +14,8 @@ Chat bridge that connects messaging platforms (**Discord** via `bot.py`, **Googl
 - **Turn cap**: hard limit per session (default 20 turns); `!reset` starts a fresh session
 - **Memory flush**: `!flush` summarises the session and persists it to disk for future context
 - **Bot-loop prevention**: auto-stops forwarding when Claude returns a `[DONE]` signal or pure punctuation in a bot-to-bot turn
+- **Live progress** (`STREAM_PROGRESS=1`): tool-by-tool activity streamed into an auto-edited message instead of a 2-minute black box
+- **Cancellation**: `!cancel` kills the in-flight backend subprocess immediately, keeping the session
 
 ## Quick start
 
@@ -43,6 +45,8 @@ All settings are in the `.env` file (or environment variables):
 | `CLAUDE_EXTRA_ARGS` | (empty) | Extra flags passed to every AI call (e.g. `--dangerously-skip-permissions`; with this flag set, the bot refuses to start unless `ALLOWED_USER_IDS` is non-empty or `UNSAFE_ALLOW_ALL_USERS=1`) |
 | `SESSION_SCOPE` | `thread` | `thread` = shared session per thread, per-user in channels; `channel` = shared per channel; `user` = per channel/user pair (legacy) |
 | `CLAUDE_TIMEOUT` | `120` | Subprocess timeout in seconds |
+| `STREAM_PROGRESS` | `0` | `1` streams live tool activity into an auto-edited progress message (recommended with the claude CLI backend) |
+| `PROGRESS_EDIT_INTERVAL` | `2.0` | Min seconds between progress-message edits |
 | `ATTACH_DIR` | `/tmp/discord-attachments` | Where user attachments are saved (randomised filenames) |
 | `ATTACH_MAX_BYTES` | `8388608` | Max attachment size (8 MB); larger uploads are skipped |
 | `RATE_LIMIT_PER_MIN` | `5` | Max requests per user per minute |
@@ -57,6 +61,7 @@ All settings are in the `.env` file (or environment variables):
 | Command | Effect |
 |---|---|
 | `!reset` | Clear session; start fresh |
+| `!cancel` | Kill the in-flight backend run (session is kept) |
 | `!stop` | Stop bot from forwarding further replies in this session |
 | `!flush` | Summarise session and persist to disk for future reference |
 | `!status` | Show current session key, scope, turn count, model, and state |

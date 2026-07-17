@@ -75,6 +75,11 @@ SESSION_SCOPE = os.getenv("SESSION_SCOPE", "thread").strip().lower()
 if SESSION_SCOPE not in {"thread", "channel", "user"}:
     sys.exit(f"Invalid SESSION_SCOPE {SESSION_SCOPE!r}: use thread, channel, or user")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
+# Live progress: stream tool activity into an auto-edited Discord message
+# (uses --output-format stream-json; works with the claude CLI and with the
+# bundled adapters — adapters just show no intermediate steps). Default off.
+STREAM_PROGRESS = os.getenv("STREAM_PROGRESS", "0") == "1"
+PROGRESS_EDIT_INTERVAL = float(os.getenv("PROGRESS_EDIT_INTERVAL", "2.0"))
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 TASK_STATE_INTERVAL = int(os.getenv("TASK_STATE_INTERVAL", "5"))  # 0 = disabled
@@ -374,16 +379,63 @@ def _validate_send_file(path: str) -> str | None:
     return real
 
 
+class _ProgressReporter:
+    """Streams backend tool activity into one auto-edited Discord message."""
+
+    def __init__(self, channel: discord.abc.Messageable, max_lines: int = 6):
+        self.channel = channel
+        self.max_lines = max_lines
+        self.msg: discord.Message | None = None
+        self.steps: list[str] = []
+        self.count = 0
+        self.start = time.monotonic()
+        self._last_edit = 0.0
+
+    def _render(self, header: str) -> str:
+        lines = "\n".join(f"▸ {s}" for s in self.steps[-self.max_lines:])
+        text = f"{header}（{self.count} 步，{int(time.monotonic() - self.start)}s）"
+        if lines:
+            text += f"\n```\n{lines}\n```"
+        return text[:1900]
+
+    async def on_step(self, desc: str) -> None:
+        self.count += 1
+        self.steps.append(desc)
+        now = time.monotonic()
+        try:
+            if self.msg is None:
+                self.msg = await self.channel.send(self._render("⏳ 執行中"))  # type: ignore[union-attr]
+                self._last_edit = now
+            elif now - self._last_edit >= PROGRESS_EDIT_INTERVAL:
+                await self.msg.edit(content=self._render("⏳ 執行中"))
+                self._last_edit = now
+        except Exception as e:  # progress UI must never break the run
+            log.debug(f"progress update failed: {e}")
+
+    async def finish(self, cancelled: bool = False) -> None:
+        if self.msg is None:
+            return
+        header = "⛔ 已取消" if cancelled else "✅ 完成"
+        try:
+            elapsed = int(time.monotonic() - self.start)
+            await self.msg.edit(content=f"{header}（{self.count} 步，{elapsed}s）")
+        except Exception as e:
+            log.debug(f"progress finish failed: {e}")
+
+
 async def run_claude(
-    prompt: str, session_key: str, extra_args: list[str] | None = None
+    prompt: str,
+    session_key: str,
+    extra_args: list[str] | None = None,
+    on_progress=None,
 ) -> str:
+    """Returns the backend reply text; empty string means the run was cancelled."""
     session_id = _sessions.get(session_key)
 
     # Inject exit-signal instruction once on the first turn of a new session
     send_prompt = prompt if session_id else _make_session_instruction(session_key) + prompt
 
-    reply = await bridge_core.run_backend(
-        send_prompt,
+    kwargs = dict(
         backend_bin=CLAUDE_BIN,
         base_args=CLAUDE_EXTRA_ARGS,
         model=_session_model.get(session_key),
@@ -391,13 +443,23 @@ async def run_claude(
         resume=session_id,
         cwd=WORKING_DIR,
         timeout=TIMEOUT,
+        proc_key=session_key,
     )
+    if on_progress is not None:
+        reply = await bridge_core.run_backend_streaming(
+            send_prompt, on_progress=on_progress, **kwargs
+        )
+    else:
+        reply = await bridge_core.run_backend(send_prompt, **kwargs)
+
+    if reply.cancelled:
+        return ""
 
     # 失效 session：清除舊 ID 並重試一次（不帶 --resume，重新注入 instruction）
     if reply.stale_session:
         _sessions.pop(session_key, None)
         _save_sessions()
-        return await run_claude(prompt, session_key, extra_args=extra_args)
+        return await run_claude(prompt, session_key, extra_args=extra_args, on_progress=on_progress)
 
     if reply.session_id:
         _sessions[session_key] = reply.session_id
@@ -459,7 +521,18 @@ async def _flush(
     )
 
     async with channel.typing():  # type: ignore[arg-type]
-        reply = await run_claude(combined, session_key, extra_args=extra_args)
+        if STREAM_PROGRESS and not is_bot_author:
+            reporter = _ProgressReporter(channel)
+            reply = await run_claude(
+                combined, session_key, extra_args=extra_args, on_progress=reporter.on_step
+            )
+            await reporter.finish(cancelled=(reply == ""))
+        else:
+            reply = await run_claude(combined, session_key, extra_args=extra_args)
+
+    # cancelled via !cancel — the cancel handler already confirmed to the user
+    if reply == "":
+        return
 
     # Detect Claude's self-exit signal
     if _DONE_SIGNAL in reply:
@@ -668,6 +741,19 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"{message.author.mention} Session cleared.")
         return
 
+    if content == "!cancel":
+        # drop any buffered-but-unsent messages first
+        if session_key in _pending:
+            _pending.pop(session_key).cancel()
+        _pending_texts.pop(session_key, None)
+        _pending_author.pop(session_key, None)
+        if bridge_core.cancel_backend(session_key):
+            log.info(f"Cancelled in-flight backend run for {session_key}")
+            await message.channel.send(f"{message.author.mention} ⛔ 已中斷目前執行。session 保留，可直接繼續對話。")
+        else:
+            await message.channel.send(f"{message.author.mention} 沒有進行中的任務。")
+        return
+
     if content == "!stop":
         if session_key in _pending:
             _pending.pop(session_key).cancel()
@@ -752,6 +838,7 @@ async def on_message(message: discord.Message):
             "",
             "**Session 控制**",
             "`!reset` — 清除 session，重新開始",
+            "`!cancel` — 中斷進行中的執行（session 保留）",
             "`!stop` — 停止 Claude 回應（bot 訊息被擋下）",
             "`!flush` — 壓縮對話記憶存檔",
             "`!status` — 顯示目前 session 狀態（key / 輪數 / 模型）",

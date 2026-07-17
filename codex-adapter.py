@@ -197,6 +197,7 @@ def main() -> None:
     parser.add_argument("--output-format", default="json")
     parser.add_argument("--resume", default=None, metavar="SESSION_ID")
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--verbose", action="store_true")  # streaming mode passes this
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("prompt", nargs="?", default=None)
 

@@ -28,9 +28,13 @@ Google Chat ─ gchat_bridge.py ─┘                           or  codex-adapt
 ### bridge_core.py
 
 Platform-agnostic core: `run_backend()` (one CLI-contract invocation, stale-session
-detection), `load_sessions()`/`save_sessions()` (atomic envelope), `chunk_text()`
-(fence-aware, per-platform limit), `CMD_MAP`/`parse_command()` (!plan/!think/… modes),
-`RateLimiter`.
+detection), `run_backend_streaming()` (same via `--output-format stream-json`; surfaces
+tool_use events through an `on_progress` callback, and stays compatible with adapters
+that print a single JSON object), `cancel_backend(proc_key)` (kills the in-flight
+subprocess registered under that key — frontends pass the session key as `proc_key`,
+so `!cancel` terminates the right run), `load_sessions()`/`save_sessions()` (atomic
+envelope), `chunk_text()` (fence-aware, per-platform limit), `CMD_MAP`/`parse_command()`
+(!plan/!think/… modes), `RateLimiter`.
 
 ### gchat_bridge.py
 

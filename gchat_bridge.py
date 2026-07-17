@@ -273,7 +273,11 @@ async def run_ai(
         resume=session_id,
         cwd=WORKING_DIR,
         timeout=TIMEOUT,
+        proc_key=session_key,
     )
+
+    if reply.cancelled:
+        return ""
 
     if reply.stale_session:
         _sessions.pop(session_key, None)
@@ -322,6 +326,14 @@ async def handle_event(event: dict) -> None:
         await send_message(space_name, "Session cleared.", thread_name)
         return
 
+    if content == "!cancel":
+        if bridge_core.cancel_backend(session_key):
+            log.info(f"Cancelled in-flight backend run for {session_key}")
+            await send_message(space_name, "⛔ 已中斷目前執行。session 保留，可直接繼續對話。", thread_name)
+        else:
+            await send_message(space_name, "沒有進行中的任務。", thread_name)
+        return
+
     if content == "!status":
         session_id = _sessions.get(session_key)
         shared = "共享（同 thread/space 所有人同一對話）"
@@ -339,6 +351,7 @@ async def handle_event(event: dict) -> None:
         lines = [
             "*Google Chat ↔ AI Bridge 指令*",
             "`!reset` — 清除 session，重新開始",
+            "`!cancel` — 中斷進行中的執行（session 保留）",
             "`!status` — 顯示目前 session 狀態",
             "",
             "*工作模式*（`!cmd <task>`）",
@@ -379,6 +392,8 @@ async def handle_event(event: dict) -> None:
         extra_args=extra_args,
         instruction=_make_session_instruction(space_name, thread_name),
     )
+    if reply == "":  # cancelled via !cancel — the cancel handler already replied
+        return
     await send_message(space_name, reply, thread_name)
 
 

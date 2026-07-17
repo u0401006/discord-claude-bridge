@@ -80,6 +80,7 @@ def main() -> None:
     parser.add_argument("--output-format", default="json")
     parser.add_argument("--resume", default=None, metavar="SESSION_ID")
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--verbose", action="store_true")  # streaming mode passes this
     # Our own flags (set via CLAUDE_EXTRA_ARGS in .env)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--system", default=DEFAULT_SYSTEM)
