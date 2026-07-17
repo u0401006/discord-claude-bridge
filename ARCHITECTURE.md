@@ -2,21 +2,46 @@
 
 ## Overview
 
-A Discord bot that bridges user messages to AI backends (Claude Code or OpenAI Codex) and returns responses. Each Discord channel/user pair is a persistent session.
+A chat bridge connecting messaging frontends to AI backends. Frontends and backends are independently pluggable around two seams:
+
+1. **Backend seam — the CLI JSON contract.** Every backend is invoked as
+   `<CLAUDE_BIN> [args] [--model M] [--resume ID] --print --output-format json -- <prompt>`
+   and returns `{"result": "...", "session_id": "..."}` on stdout. Anything speaking this
+   contract (claude CLI, codex-adapter.py, openai-adapter.py) works with every frontend
+   with zero changes.
+2. **Shared core — `bridge_core.py`.** Backend invocation, session persistence
+   (atomic envelope), fence-aware chunking, `!cmd` prompt modes, and rate limiting live
+   here. Frontends contain only platform I/O and platform-specific policy.
 
 ```
-Discord
-  │  (message)
-  ▼
-bot.py  ──────────────────► claude CLI  (CLAUDE_BIN, default)
-  │                     or  codex-adapter.py  (via CLAUDE_BIN override)
-  │                     or  openai-adapter.py
+Discord ──── bot.py ───────────┐
+                               ├──► bridge_core.run_backend ──► claude CLI  (CLAUDE_BIN)
+Google Chat ─ gchat_bridge.py ─┘                           or  codex-adapter.py
+   (Pub/Sub pull)                                          or  openai-adapter.py
   │
-  └─ sessions.json  (session IDs + turn counts + stopped flags)
-  └─ memory/<ch>/<thread>/context.md  (flushed summaries)
+  └─ sessions.json / gchat-sessions.json  (session IDs + turns + stopped + models)
+  └─ memory/<ch>/<thread>/context.md  (flushed summaries, Discord only)
 ```
 
 ## Components
+
+### bridge_core.py
+
+Platform-agnostic core: `run_backend()` (one CLI-contract invocation, stale-session
+detection), `load_sessions()`/`save_sessions()` (atomic envelope), `chunk_text()`
+(fence-aware, per-platform limit), `CMD_MAP`/`parse_command()` (!plan/!think/… modes),
+`RateLimiter`.
+
+### gchat_bridge.py
+
+Google Chat frontend. Receives MESSAGE events via Cloud Pub/Sub **pull** (outbound gRPC
+only — NAT-friendly, no public endpoint), replies via Chat API `spaces.messages.create`
+(app auth, scope `chat.bot`). Handles at-least-once redelivery (LRU dedup on message
+name), converts backend Markdown to Chat's own syntax, chunks to `GCHAT_CHUNK` chars
+(32,000-byte platform limit) and throttles to the 1 write/s/space quota. Session scope
+`auto`: thread-scoped in threaded spaces, space-scoped in DMs/flat spaces (which mint a
+new thread per message). Sessions persist to `gchat-sessions.json` — a separate file so
+a Discord bridge sharing the directory never clobbers it. Setup: `docs/gchat-setup.md`.
 
 ### bot.py
 

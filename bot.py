@@ -5,7 +5,6 @@ Discord ↔ Claude Code Bridge
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -17,6 +16,8 @@ from collections import defaultdict
 
 import discord
 from dotenv import load_dotenv
+
+import bridge_core
 
 # 支援 --env /path/to/.env，讓多個 bot 實例共用同一份 bot.py
 _env_path: str | None = None
@@ -109,9 +110,6 @@ MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
 ATTACH_DIR = os.path.expanduser(os.getenv("ATTACH_DIR", "/tmp/discord-attachments"))
 ATTACH_MAX_BYTES = int(os.getenv("ATTACH_MAX_BYTES", str(8 * 1024 * 1024)))
 
-# rate limiter: user_id → list of timestamps
-_rate_buckets: dict[int, list[float]] = defaultdict(list)
-
 # turn counter / stopped sessions — initialized from disk below (see _load_sessions)
 _turn_counts: dict[str, int] = defaultdict(int)
 _stopped_sessions: set[str] = set()
@@ -137,69 +135,8 @@ _TASK_STATE_MARKER = "📋 [TASK STATE]"
 # per-session model override: session_key → model name
 _session_model: dict[str, str] = {}
 
-# ── CLI command mapping ──────────────────────────────────────────────────────
-# Each entry: "!cmd" → {"prefix": str, "args": list[str], "help": str}
-# - prefix: prepended to the user prompt (system-style instruction)
-# - args: extra CLI flags added to the claude invocation
-# - help: shown in !help output
-# Commands that take remaining text as <task>; standalone commands return immediately.
-
-_CMD_MAP: dict[str, dict] = {
-    "!plan": {
-        "prefix": (
-            "[Mode: Plan] 在動手寫任何程式碼之前，先產出結構化的實作計畫：\n"
-            "1. 目標確認\n2. 子任務拆解（含檔案路徑）\n3. 風險與邊界條件\n4. 驗收標準\n"
-            "計畫完成後停下，等使用者確認才執行。\n\n"
-        ),
-        "args": [],
-        "help": "!plan <task> — 先規劃再執行，等確認後才動手",
-    },
-    "!think": {
-        "prefix": (
-            "[Mode: Deep Think] 這個問題需要深度思考。\n"
-            "請先花時間分析問題的各個面向、可能的方案與 trade-offs，"
-            "再給出你的結論和建議。不急著給答案，品質優先。\n\n"
-        ),
-        "args": [],
-        "help": "!think <task> — 深度思考模式，分析各面向再給結論",
-    },
-    "!review": {
-        "prefix": (
-            "[Mode: Code Review] 請對以下程式碼或變更進行 code review：\n"
-            "- 指出 bug、安全風險、效能問題\n"
-            "- 建議改善方向\n"
-            "- 標明嚴重程度 (critical / warning / suggestion)\n\n"
-        ),
-        "args": [],
-        "help": "!review <code or file> — Code review 模式",
-    },
-    "!debug": {
-        "prefix": (
-            "[Mode: Systematic Debug] 請用系統化方式除錯：\n"
-            "1. 重現問題（確認症狀）\n2. 建立假設\n3. 驗證假設（讀 code / 跑測試）\n"
-            "4. 找到 root cause\n5. 修復並驗證\n"
-            "每一步都回報你的發現。\n\n"
-        ),
-        "args": [],
-        "help": "!debug <問題描述> — 系統化除錯流程",
-    },
-    "!quick": {
-        "prefix": (
-            "[Mode: Quick] 直接執行，不需要解釋過程。"
-            "只回覆結果和必要的 before/after 對比。\n\n"
-        ),
-        "args": [],
-        "help": "!quick <task> — 快速執行，省略解釋",
-    },
-    "!summarize": {
-        "prefix": (
-            "[Mode: Summarize] 請用繁體中文、中央社風格，將以下內容濃縮為 100 字以內摘要。"
-            "只輸出摘要本文。\n\n"
-        ),
-        "args": [],
-        "help": "!summarize <內容> — 中央社風格 100 字摘要",
-    },
-}
+# ── CLI command mapping — shared with all frontends (see bridge_core.CMD_MAP) ─
+_CMD_MAP: dict[str, dict] = bridge_core.CMD_MAP
 
 # Direct CLI commands: these bypass run_claude and call claude subcommands directly.
 # "!discord_cmd" → {"cli": ["subcommand", ...], "help": str}
@@ -252,19 +189,8 @@ async def _run_direct_cmd(
         return f"Bridge error: {e}"
 
 
-def _parse_command(content: str) -> tuple[str, list[str]]:
-    """Parse !cmd from content. Returns (modified_content, extra_cli_args).
+_parse_command = bridge_core.parse_command
 
-    If content starts with a mapped !cmd, prepend its prefix and collect extra args.
-    """
-    extra_args: list[str] = []
-    for cmd, spec in _CMD_MAP.items():
-        if content == cmd or content.startswith(cmd + " "):
-            task = content[len(cmd):].strip()
-            prefix = spec["prefix"]
-            extra_args = list(spec["args"])
-            return prefix + task, extra_args
-    return content, extra_args
 
 def _session_key_for(channel, user_id: int) -> str:
     """Map a Discord channel/author pair to a session key according to SESSION_SCOPE.
@@ -333,39 +259,14 @@ def _make_session_instruction(session_key: str) -> str:
 
 
 def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str], dict[str, str]]:
-    try:
-        with open(SESSIONS_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "sessions" in data:
-            # New envelope format
-            sessions = data["sessions"]
-            turn_counts = {k: int(v) for k, v in data.get("turn_counts", {}).items()}
-            stopped = set(data.get("stopped_sessions", []))
-            models = dict(data.get("session_models", {}))
-        else:
-            # Legacy format: plain {session_key: session_id}
-            sessions = data
-            turn_counts = {}
-            stopped = set()
-            models = {}
-        return sessions, turn_counts, stopped, models
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}, {}, set(), {}
+    # module-level SESSIONS_FILE is read at call time (tests patch it)
+    return bridge_core.load_sessions(SESSIONS_FILE)
 
 
 def _save_sessions() -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(SESSIONS_FILE)), exist_ok=True)
-    data = {
-        "sessions": _sessions,
-        "turn_counts": dict(_turn_counts),
-        "stopped_sessions": list(_stopped_sessions),
-        "session_models": _session_model,
-    }
-    # atomic write: a crash mid-dump must not corrupt the existing file
-    tmp_path = SESSIONS_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp_path, SESSIONS_FILE)
+    bridge_core.save_sessions(
+        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions, _session_model
+    )
 
 
 # session tracker — all four structures persisted together across restarts
@@ -377,14 +278,11 @@ _session_model.update(_sm)
 del _tc, _ss, _sm
 
 
+_rate_limiter = bridge_core.RateLimiter(RATE_LIMIT_PER_MIN)
+
+
 def is_rate_limited(user_id: int) -> bool:
-    now = time.monotonic()
-    bucket = _rate_buckets[user_id]
-    _rate_buckets[user_id] = [t for t in bucket if now - t < 60]
-    if len(_rate_buckets[user_id]) >= RATE_LIMIT_PER_MIN:
-        return True
-    _rate_buckets[user_id].append(now)
-    return False
+    return _rate_limiter.is_limited(user_id)
 
 
 intents = discord.Intents.default()
@@ -393,50 +291,13 @@ client = discord.Client(intents=intents)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-
-def _scan_fence(text: str) -> str | None:
-    """Return the currently-open fence lang (empty str for plain ```), or None if closed."""
-    state: str | None = None
-    for line in text.splitlines():
-        m = re.match(r"^```(\w*)$", line.rstrip())
-        if m:
-            state = None if state is not None else m.group(1)
-    return state
+# fence-aware chunking lives in bridge_core (shared by all frontends)
+_scan_fence = bridge_core.scan_fence
 
 
 def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
     """Split text into Discord-safe chunks, closing/reopening code fences at boundaries."""
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-    reopen = ""  # fence re-open header to prepend to next chunk
-
-    while remaining:
-        work = reopen + remaining
-        reopen = ""
-
-        if len(work) <= limit:
-            chunks.append(work)
-            break
-
-        # Leave 4 chars headroom for potential "\n```" close suffix
-        budget = limit - 4
-        nl = work.rfind("\n", 0, budget)
-        cut = nl if nl > budget // 2 else budget  # prefer newline; hard-cut for long lines
-
-        head = work[:cut]
-        remaining = work[cut:].lstrip("\n")
-
-        fence = _scan_fence(head)
-        if fence is not None:
-            head += "\n```"
-            reopen = f"```{fence}\n"
-
-        chunks.append(head)
-
-    return chunks
+    return bridge_core.chunk_text(text, limit)
 
 
 def _should_write_interim_task_state(turn_count: int, interval: int) -> bool:
@@ -519,73 +380,29 @@ async def run_claude(
     session_id = _sessions.get(session_key)
 
     # Inject exit-signal instruction once on the first turn of a new session
-    if not session_id:
-        prompt = _make_session_instruction(session_key) + prompt
+    send_prompt = prompt if session_id else _make_session_instruction(session_key) + prompt
 
-    args = [CLAUDE_BIN] + CLAUDE_EXTRA_ARGS
-    # per-session model override
-    model = _session_model.get(session_key)
-    if model:
-        args += ["--model", model]
-    if extra_args:
-        args += extra_args
-    if session_id:
-        args += ["--resume", session_id]
-    args += ["--print", "--output-format", "json", "--", prompt]
+    reply = await bridge_core.run_backend(
+        send_prompt,
+        backend_bin=CLAUDE_BIN,
+        base_args=CLAUDE_EXTRA_ARGS,
+        model=_session_model.get(session_key),
+        extra_args=extra_args or (),
+        resume=session_id,
+        cwd=WORKING_DIR,
+        timeout=TIMEOUT,
+    )
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=WORKING_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return f"Timeout after {TIMEOUT}s"
+    # 失效 session：清除舊 ID 並重試一次（不帶 --resume，重新注入 instruction）
+    if reply.stale_session:
+        _sessions.pop(session_key, None)
+        _save_sessions()
+        return await run_claude(prompt, session_key, extra_args=extra_args)
 
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            # 失效 session：清除舊 ID 並重試一次（不帶 --resume）
-            if session_id and "No conversation found" in err:
-                _sessions.pop(session_key, None)
-                _save_sessions()
-                return await run_claude(prompt, session_key, extra_args=extra_args)
-            # Claude CLI outputs errors as JSON to stdout (not stderr) on some failures
-            raw_out = stdout.decode().strip()
-            human_reason = ""
-            if raw_out:
-                try:
-                    out_data = json.loads(raw_out)
-                    result_msg = out_data.get("result", "")
-                    api_status = out_data.get("api_error_status")
-                    if api_status == 429 or "session limit" in result_msg.lower():
-                        human_reason = f"Claude session limit 已達上限。{result_msg}"
-                    elif result_msg:
-                        human_reason = result_msg
-                except json.JSONDecodeError:
-                    human_reason = raw_out[:500]
-            detail = human_reason or err or "(no detail)"
-            log.error(f"claude exit {proc.returncode}: {detail[:200]}")
-            return f"```\nError (exit {proc.returncode}):\n{detail[:1800]}\n```"
-
-        raw = stdout.decode().strip()
-        try:
-            data = json.loads(raw)
-            new_id: str | None = data.get("session_id")
-            if new_id:
-                _sessions[session_key] = new_id
-                _save_sessions()
-            return data.get("result") or "(no output)"
-        except json.JSONDecodeError:
-            return raw or "(no output)"
-
-    except FileNotFoundError:
-        return f"`{CLAUDE_BIN}` not found. Set CLAUDE_BIN in .env."
-    except Exception as e:
-        return f"Bridge error: {e}"
+    if reply.session_id:
+        _sessions[session_key] = reply.session_id
+        _save_sessions()
+    return reply.text
 
 
 async def _flush(

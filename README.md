@@ -1,6 +1,6 @@
 # discord-claude-bridge
 
-Discord bot that bridges channel messages to an AI backend (Claude Code or OpenAI Codex) and returns responses in-channel. Sessions are persistent and resumable; by default each Discord **thread is one shared session** (everyone in the thread talks to the same conversation), while top-level channel messages stay per-user. See `SESSION_SCOPE`.
+Chat bridge that connects messaging platforms (**Discord** via `bot.py`, **Google Chat** via `gchat_bridge.py`) to an AI backend (Claude Code or OpenAI Codex) and returns responses in-channel. Frontends and backends are independently pluggable — any frontend works with any backend through one CLI contract (see Architecture). Sessions are persistent and resumable; by default each Discord **thread is one shared session** (everyone in the thread talks to the same conversation), while top-level channel messages stay per-user. See `SESSION_SCOPE`.
 
 ## Features
 
@@ -82,6 +82,22 @@ One-time auth: `printenv OPENAI_API_KEY | codex login --with-api-key`
 CLAUDE_BIN=/path/to/discord-claude-bridge/openai-adapter.py
 OPENAI_API_KEY=sk-...
 ```
+
+## Frontends
+
+### Discord (default)
+`bot.py` — WebSocket gateway, works behind NAT. See Quick start above.
+
+### Google Chat
+`gchat_bridge.py` — receives events via a Cloud Pub/Sub **pull** subscription (outbound-only, also NAT-friendly; no public HTTPS endpoint needed) and replies through the Chat API. Same backend configuration (`CLAUDE_BIN` / `CLAUDE_EXTRA_ARGS`), same `!cmd` modes, same session envelope. Chat apps only receive DMs and @mentions.
+
+```bash
+pip install -r requirements-gchat.txt
+cp .env.gchat.example .env.gchat   # GCP project, subscription, service-account key
+python3 gchat_bridge.py --env .env.gchat
+```
+
+Full GCP/Chat API setup: [docs/gchat-setup.md](docs/gchat-setup.md)
 
 ## Running as a service (macOS)
 
