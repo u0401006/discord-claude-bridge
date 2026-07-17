@@ -744,6 +744,19 @@ async def on_message(message: discord.Message):
 
     content = re.sub(r'^(<@!?\d+>\s*)+', '', content).strip()
 
+    # Inject replied-to message as context so the model sees what the user is replying to
+    if message.type == discord.MessageType.reply and message.reference:
+        ref_msg = message.reference.resolved
+        if ref_msg is None:
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            except Exception:
+                ref_msg = None
+        if ref_msg is not None and ref_msg.content:
+            ref_author = ref_msg.author.display_name
+            ref_text = ref_msg.content[:500]
+            content = f"[回覆 {ref_author}：{ref_text}]\n\n{content}"
+
     session_key = _session_key_for(message.channel, message.author.id)
 
     # [[ws:path]] control directive: set this session's working directory
