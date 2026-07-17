@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 from collections import defaultdict
 
 import discord
@@ -59,11 +60,19 @@ WEBHOOK_PASSTHROUGH_IDS: set[int] = {
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 # Extra args prepended to every CLAUDE_BIN call.
-# Claude Code default: --dangerously-skip-permissions
+# Claude Code unattended mode: set --dangerously-skip-permissions explicitly in .env.
 # OpenAI adapter: leave empty or set --model gpt-4o
 CLAUDE_EXTRA_ARGS: list[str] = [
-    a for a in os.getenv("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions").split() if a
+    a for a in os.getenv("CLAUDE_EXTRA_ARGS", "").split() if a
 ]
+# Session scope: how a Discord message maps to a Claude session.
+#   thread  (default) — inside a thread everyone shares one session (th{thread_id});
+#                       top-level channel messages stay per-user (ch{id}_u{uid})
+#   channel           — everyone in a channel shares one session (ch{id})
+#   user              — per channel/user pair (legacy behaviour)
+SESSION_SCOPE = os.getenv("SESSION_SCOPE", "thread").strip().lower()
+if SESSION_SCOPE not in {"thread", "channel", "user"}:
+    sys.exit(f"Invalid SESSION_SCOPE {SESSION_SCOPE!r}: use thread, channel, or user")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
@@ -89,9 +98,16 @@ _SEND_FILE_EXTS: frozenset[str] = frozenset(
     if e.strip()
 )
 
-_LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
+# Same default as the logging handler above, so sessions.json/memory live next to the log
+_LOG_DIR = os.path.dirname(
+    os.path.expanduser(os.getenv("LOG_FILE", "~/discord-claude-bridge.log"))
+)
 SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
 MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
+
+# attachment handling: dedicated dir + size cap (bytes)
+ATTACH_DIR = os.path.expanduser(os.getenv("ATTACH_DIR", "/tmp/discord-attachments"))
+ATTACH_MAX_BYTES = int(os.getenv("ATTACH_MAX_BYTES", str(8 * 1024 * 1024)))
 
 # rate limiter: user_id → list of timestamps
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
@@ -106,6 +122,11 @@ _pending_texts: dict[str, list[str]] = defaultdict(list)
 
 # thread redirect: session_key → channel to reply to (updated by on_thread_create)
 _pending_channel: dict[str, discord.abc.Messageable] = {}
+# last buffering author per session — used to redirect only the thread creator's session
+_pending_author: dict[str, int] = {}
+
+# sessions already told they hit MAX_TURNS (avoid repeating the notice every message)
+_limit_notified: set[str] = set()
 
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
@@ -245,6 +266,27 @@ def _parse_command(content: str) -> tuple[str, list[str]]:
             return prefix + task, extra_args
     return content, extra_args
 
+def _session_key_for(channel, user_id: int) -> str:
+    """Map a Discord channel/author pair to a session key according to SESSION_SCOPE.
+
+    Threads are detected via parent_id (threads have one, regular channels don't).
+    """
+    ch_id = getattr(channel, "id", 0)
+    parent_id = getattr(channel, "parent_id", None)
+    if SESSION_SCOPE == "thread":
+        if parent_id:
+            return f"th{ch_id}"
+        return f"ch{ch_id}_u{user_id}"
+    if SESSION_SCOPE == "channel":
+        return f"ch{parent_id or ch_id}"
+    return f"ch{ch_id}_u{user_id}"
+
+
+def _is_shared_scope(session_key: str) -> bool:
+    """True if multiple users share this session (no per-user suffix)."""
+    return "_u" not in session_key
+
+
 # silent-ack patterns: any message whose stripped content matches one of these
 # is dropped without calling Claude (covers ASCII and CJK punctuation)
 _ACK_CONTENT: frozenset[str] = frozenset({".", "。", "·", "…", "...", "、"})
@@ -260,10 +302,9 @@ def _is_punct_only(text: str) -> bool:
 # system instruction injected once at the start of every new session
 def _make_session_instruction(session_key: str) -> str:
     """Build system instructions for a new Claude session (B3: memory hint, B2: discord-context)."""
-    # Extract channel_id from session_key format: ch{channel_id}_u{user_id}
-    channel_id = ""
-    if session_key.startswith("ch") and "_u" in session_key:
-        channel_id = session_key[2:].split("_u")[0]
+    # Extract channel/thread id from session_key formats: ch{id}, th{id}, ch{id}_u{uid}
+    m = re.match(r"^(?:ch|th)(\d+)", session_key)
+    channel_id = m.group(1) if m else ""
 
     done_rule = (
         f"[System: When you consider this conversation complete or the task fully done, "
@@ -291,7 +332,7 @@ def _make_session_instruction(session_key: str) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
-def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str]]:
+def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str], dict[str, str]]:
     try:
         with open(SESSIONS_FILE) as f:
             data = json.load(f)
@@ -300,14 +341,16 @@ def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str]]:
             sessions = data["sessions"]
             turn_counts = {k: int(v) for k, v in data.get("turn_counts", {}).items()}
             stopped = set(data.get("stopped_sessions", []))
+            models = dict(data.get("session_models", {}))
         else:
             # Legacy format: plain {session_key: session_id}
             sessions = data
             turn_counts = {}
             stopped = set()
-        return sessions, turn_counts, stopped
+            models = {}
+        return sessions, turn_counts, stopped, models
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}, {}, set()
+        return {}, {}, set(), {}
 
 
 def _save_sessions() -> None:
@@ -316,17 +359,22 @@ def _save_sessions() -> None:
         "sessions": _sessions,
         "turn_counts": dict(_turn_counts),
         "stopped_sessions": list(_stopped_sessions),
+        "session_models": _session_model,
     }
-    with open(SESSIONS_FILE, "w") as f:
+    # atomic write: a crash mid-dump must not corrupt the existing file
+    tmp_path = SESSIONS_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f)
+    os.replace(tmp_path, SESSIONS_FILE)
 
 
-# session tracker — all three dicts persisted together across restarts
-_sessions, _tc, _ss = _load_sessions()
+# session tracker — all four structures persisted together across restarts
+_sessions, _tc, _ss, _sm = _load_sessions()
 _sessions: dict[str, str] = _sessions          # type: ignore[no-redef]
 _turn_counts = defaultdict(int, _tc)
 _stopped_sessions: set[str] = _ss
-del _tc, _ss
+_session_model.update(_sm)
+del _tc, _ss, _sm
 
 
 def is_rate_limited(user_id: int) -> bool:
@@ -403,7 +451,9 @@ async def fetch_task_state(channel: discord.abc.Messageable, max_merge: int = 3)
     found: list[str] = []
     try:
         async for msg in channel.history(limit=50):  # type: ignore[union-attr]
-            if msg.content.startswith(_TASK_STATE_MARKER):
+            # only trust task states authored by bots — humans could spoof the
+            # marker to inject content into other users' new sessions
+            if msg.author.bot and msg.content.startswith(_TASK_STATE_MARKER):
                 found.append(msg.content)
                 if len(found) >= max_merge:
                     break
@@ -424,6 +474,17 @@ async def write_task_state(channel: discord.abc.Messageable, bot_name: str, summ
         log.info(f"Task state written to channel by {bot_name}")
     except Exception as e:
         log.warning(f"write_task_state failed: {e}")
+
+
+def _attachment_path(filename: str) -> str:
+    """Build a collision-free save path inside ATTACH_DIR for an uploaded attachment.
+
+    The client-supplied filename is reduced to its basename (no path components can
+    escape ATTACH_DIR) and prefixed with a random token so concurrent users can
+    never overwrite each other's uploads.
+    """
+    safe = os.path.basename(filename.replace("\\", "/")).strip() or "attachment"
+    return os.path.join(ATTACH_DIR, f"{uuid.uuid4().hex[:8]}_{safe}")
 
 
 def _validate_send_file(path: str) -> str | None:
@@ -491,7 +552,7 @@ async def run_claude(
             if session_id and "No conversation found" in err:
                 _sessions.pop(session_key, None)
                 _save_sessions()
-                return await run_claude(prompt, session_key)
+                return await run_claude(prompt, session_key, extra_args=extra_args)
             # Claude CLI outputs errors as JSON to stdout (not stderr) on some failures
             raw_out = stdout.decode().strip()
             human_reason = ""
@@ -540,6 +601,7 @@ async def _flush(
 
     combined = "\n".join(_pending_texts.pop(session_key, []))
     _pending.pop(session_key, None)
+    _pending_author.pop(session_key, None)
 
     if not combined:
         return
@@ -565,6 +627,13 @@ async def _flush(
     current_turn = _turn_counts[session_key]
 
     if current_turn > MAX_TURNS:
+        # tell the user once instead of silently swallowing their messages
+        if session_key not in _limit_notified and not is_bot_author:
+            _limit_notified.add(session_key)
+            await channel.send(  # type: ignore[union-attr]
+                f"{author.mention} 本對話已達上限 {MAX_TURNS} 輪，訊息不會再轉給 Claude。"
+                "輸入 `!reset` 開啟新 session。"
+            )
         return
 
     log.info(
@@ -667,9 +736,19 @@ async def on_ready():
 
 @client.event
 async def on_thread_create(thread: discord.Thread) -> None:
-    """Redirect pending session replies into a newly created thread."""
+    """Redirect pending session replies into a newly created thread.
+
+    Only the thread creator's own pending session is redirected — otherwise a
+    thread created by user A would hijack user B's in-flight reply.
+    """
+    owner_id = getattr(thread, "owner_id", None)
+    if owner_id is None:
+        return
     for sk, ch in list(_pending_channel.items()):
-        if getattr(ch, "id", None) == thread.parent_id:
+        if (
+            getattr(ch, "id", None) == thread.parent_id
+            and _pending_author.get(sk) == owner_id
+        ):
             _pending_channel[sk] = thread
             log.info(f"Thread redirect: {sk} → thread {thread.id} ({thread.name!r})")
 
@@ -715,15 +794,22 @@ async def on_message(message: discord.Message):
     if content.startswith(_TASK_STATE_MARKER):
         return
 
-    # Handle file attachments: download and save to /tmp; append text content for .txt files
+    # Handle file attachments: download into ATTACH_DIR; append text content for .txt files
     IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     TEXT_EXTS  = {'.txt'}
     attachment_texts = []
     if message.attachments:
         import aiohttp
+        os.makedirs(ATTACH_DIR, exist_ok=True)
         for att in message.attachments:
+            if att.size and att.size > ATTACH_MAX_BYTES:
+                attachment_texts.append(
+                    f"\n\n[附件 {att.filename} 超過大小上限 "
+                    f"{ATTACH_MAX_BYTES // (1024 * 1024)}MB，已略過]"
+                )
+                continue
             ext = '.' + att.filename.rsplit('.', 1)[-1].lower() if '.' in att.filename else ''
-            tmp_path = f"/tmp/discord_attach_{att.filename}"
+            tmp_path = _attachment_path(att.filename)
             try:
                 async with aiohttp.ClientSession() as http:
                     async with http.get(att.url) as resp:
@@ -731,7 +817,7 @@ async def on_message(message: discord.Message):
                         with open(tmp_path, 'wb') as f:
                             f.write(raw)
                 if ext in IMAGE_EXTS:
-                    attachment_texts.append(f"\n\n[圖片附件：{att.filename}，已存至 {tmp_path}]")
+                    attachment_texts.append(f"\n\n[圖片附件：{att.filename}，已存至 {tmp_path}，可直接 Read 該檔案]")
                 elif ext in TEXT_EXTS:
                     text = raw.decode('utf-8', errors='replace')
                     attachment_texts.append(
@@ -749,15 +835,17 @@ async def on_message(message: discord.Message):
 
     content = re.sub(r'^(<@!?\d+>\s*)+', '', content).strip()
 
-    session_key = f"ch{message.channel.id}_u{message.author.id}"
+    session_key = _session_key_for(message.channel, message.author.id)
 
     if content == "!reset":
         if session_key in _pending:
             _pending.pop(session_key).cancel()
         _pending_texts.pop(session_key, None)
+        _pending_author.pop(session_key, None)
         _sessions.pop(session_key, None)
         _turn_counts.pop(session_key, None)
         _stopped_sessions.discard(session_key)
+        _limit_notified.discard(session_key)
         _save_sessions()
         log.info(f"Session reset for {session_key}")
         await message.channel.send(f"{message.author.mention} Session cleared.")
@@ -810,12 +898,35 @@ async def on_message(message: discord.Message):
             return
         if arg == "reset":
             _session_model.pop(session_key, None)
+            _save_sessions()
             await message.channel.send(f"{message.author.mention} 已恢復預設模型。")
             return
-        resolved = _MODEL_ALIASES.get(arg.lower(), arg)
+        resolved = _MODEL_ALIASES.get(arg.lower())
+        if not resolved:
+            aliases = ", ".join(f"`{k}`" for k in _MODEL_ALIASES)
+            await message.channel.send(
+                f"{message.author.mention} 未知的模型 `{arg}`。可用別名：{aliases}，或 `!model reset`"
+            )
+            return
         _session_model[session_key] = resolved
+        _save_sessions()
         await message.channel.send(f"{message.author.mention} 本 session 模型已切換為 `{resolved}`")
         log.info(f"Model override for {session_key}: {resolved}")
+        return
+
+    if content == "!status":
+        session_id = _sessions.get(session_key)
+        turn = _turn_counts.get(session_key, 0)
+        shared = "共享（此範圍內所有人同一對話）" if _is_shared_scope(session_key) else "個人（每人獨立對話）"
+        lines = [
+            "**Session 狀態**",
+            f"- session key: `{session_key}`（scope: `{SESSION_SCOPE}`，{shared}）",
+            f"- Claude session: `{session_id[:8] + '…' if session_id else '尚未建立'}`",
+            f"- 輪數: {turn}/{MAX_TURNS}",
+            f"- 模型: `{_session_model.get(session_key, 'default')}`",
+            f"- 狀態: {'已停止（!reset 重啟）' if session_key in _stopped_sessions else '進行中'}",
+        ]
+        await message.channel.send(f"{message.author.mention}\n" + "\n".join(lines))
         return
 
     if content == "!help":
@@ -826,7 +937,8 @@ async def on_message(message: discord.Message):
             "`!reset` — 清除 session，重新開始",
             "`!stop` — 停止 Claude 回應（bot 訊息被擋下）",
             "`!flush` — 壓縮對話記憶存檔",
-            "`!model <name>` — 切換模型（opus / sonnet / haiku）",
+            "`!status` — 顯示目前 session 狀態（key / 輪數 / 模型）",
+            "`!model <name>` — 切換模型（opus / sonnet / haiku / fable）",
             "",
             "**工作模式**（`!cmd <task>`，後接任務內容）",
         ]
@@ -871,8 +983,15 @@ async def on_message(message: discord.Message):
         _save_sessions()
         log.info(f"Webhook passthrough auto-reset for {session_key} (user {message.author.id})")
 
+    # shared sessions (thread/channel scope): tag each buffered message with the
+    # speaker so Claude can tell participants apart (commands stay unprefixed)
+    if _is_shared_scope(session_key) and not content.startswith("!"):
+        speaker = getattr(message.author, "display_name", None) or str(message.author)
+        content = f"[{speaker}] {content}"
+
     # debounce: buffer content and restart sliding-window timer
     _pending_texts[session_key].append(content)
+    _pending_author[session_key] = message.author.id
     if session_key in _pending:
         _pending[session_key].cancel()
 
@@ -898,4 +1017,14 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         sys.exit("DISCORD_TOKEN is not set")
+    # unattended-permissions mode with no user allowlist = anyone in the channel
+    # can run arbitrary commands on this machine; refuse unless explicitly overridden
+    if "--dangerously-skip-permissions" in CLAUDE_EXTRA_ARGS and not ALLOWED_USER_IDS:
+        if os.getenv("UNSAFE_ALLOW_ALL_USERS") != "1":
+            sys.exit(
+                "Refusing to start: --dangerously-skip-permissions is set but "
+                "ALLOWED_USER_IDS is empty (anyone could execute commands). "
+                "Set ALLOWED_USER_IDS, or set UNSAFE_ALLOW_ALL_USERS=1 to override."
+            )
+        log.warning("UNSAFE_ALLOW_ALL_USERS=1: skip-permissions with no user allowlist!")
     client.run(DISCORD_TOKEN)

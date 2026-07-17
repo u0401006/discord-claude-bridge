@@ -24,7 +24,7 @@ Main process. Responsibilities:
 
 | Area | Detail |
 |---|---|
-| Session key | `ch{channel_id}_u{user_id}` |
+| Session key | Scope-dependent (`SESSION_SCOPE`): `thread` (default) → `th{thread_id}` inside threads (shared by all participants), `ch{channel_id}_u{user_id}` at channel top level; `channel` → `ch{channel_id}` (shared); `user` → `ch{channel_id}_u{user_id}` (legacy). Shared-scope messages are prefixed `[speaker]` before forwarding. Backend-agnostic: adapters only ever see `--resume <session_id>`. |
 | Debounce | Buffers incoming messages for `DEBOUNCE_SECONDS` before sending to Claude |
 | Rate limiting | `RATE_LIMIT_PER_MIN` per user (sliding window, in-memory) |
 | Turn cap | `MAX_TURNS` per session; saved to disk |
@@ -34,10 +34,11 @@ Main process. Responsibilities:
 | Memory flush | `!flush` summarises session and appends to `memory/<ch>/<thread>/context.md` |
 | Session reset | `!reset` clears session_id, turn count, stopped flag |
 
-**Persisted state** (`sessions.json` envelope):
+**Persisted state** (`sessions.json` envelope, written atomically via temp file + `os.replace`):
 - `sessions`: `{session_key → claude_session_id}`
 - `turn_counts`: `{session_key → int}` — survives restart
 - `stopped_sessions`: `[session_key, …]` — survives restart
+- `session_models`: `{session_key → model}` — `!model` overrides survive restart
 
 **Ephemeral state** (lost on restart, by design):
 - `_rate_buckets`: sliding-window rate limiter
@@ -75,8 +76,11 @@ Direct OpenAI API adapter (no CLI required). Same interface contract as `codex-a
 ## Security model
 
 - **SEND_FILE**: `_validate_send_file()` resolves `realpath`, checks the result is inside `SEND_FILE_ALLOWED_DIRS` (default: `WORKING_DIR`), and verifies the extension is in `SEND_FILE_ALLOWED_EXTS`. Paths that escape these constraints are silently dropped and logged as warnings.
-- **Permissions**: `--dangerously-skip-permissions` is **not** a default; callers must set it explicitly via `CLAUDE_EXTRA_ARGS`.
+- **Permissions**: `--dangerously-skip-permissions` is **not** a default; callers must set it explicitly via `CLAUDE_EXTRA_ARGS`. If it is set while `ALLOWED_USER_IDS` is empty, the bot refuses to start (`UNSAFE_ALLOW_ALL_USERS=1` overrides).
 - **Channel/user guards**: evaluated before any AI call; both allow-list and deny-list supported.
+- **Task state trust**: `fetch_task_state()` only accepts `📋 [TASK STATE]` messages authored by bots — a human pasting the marker cannot inject content into other sessions.
+- **Attachments**: saved under `ATTACH_DIR` with a random prefix + basename only (no traversal, no cross-user overwrites); uploads over `ATTACH_MAX_BYTES` are skipped.
+- **Model override**: `!model` accepts alias-listed models only.
 
 ## Runtime management (macOS)
 
