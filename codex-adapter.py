@@ -230,13 +230,14 @@ def main() -> None:
     else:
         reply, codex_sid = run_codex(prompt, args.model, resume_id=None)
 
-    # Persist history (keyed by our adapter session_id)
-    history.append({"role": "user", "content": prompt})
-    history.append({"role": "assistant", "content": reply})
-    save_history(adapter_session_id, history)
-
     # Use codex's own session_id if captured; else keep ours
     out_session = codex_sid or adapter_session_id
+
+    # Persist history keyed by out_session — the id bot.py will pass as --resume next turn.
+    # Saving under adapter_session_id (uuid) would cause a key mismatch on the next call.
+    history.append({"role": "user", "content": prompt})
+    history.append({"role": "assistant", "content": reply})
+    save_history(out_session, history)
     out = {"result": reply, "session_id": out_session}
     print(json.dumps(out, ensure_ascii=False))
 
