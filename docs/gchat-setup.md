@@ -66,6 +66,32 @@ python3 gchat_bridge.py --env .env.gchat
 
 在 Google Chat 搜尋你的 app 名稱開 DM，或把 app 加進 space 後 @提及它。
 
+## 選配：讓 Claude 讀 Chat 歷史（Chat MCP server）
+
+Google 提供代管的 **Chat MCP server**（`https://chatmcp.googleapis.com/mcp/v1`，
+Developer Preview），讓 AI 客戶端以「使用者本人」的 OAuth 身分讀取 Chat：
+`list_messages`、`search_messages`、`search_conversations`（另有 `send_message`）。
+
+它**不能**取代這個 bridge——MCP 是 on-demand 工具，收不到任何事件；但可以補上
+「新 session 沒有前文」的缺口：bridge 預設（`GCHAT_MCP_CONTEXT_HINT=1`）會在每個
+新 session 的第一輪注入提示，告訴後端目前的 space/thread resource name，若後端
+掛了 Chat MCP server 就會先撈回最近的對話再回答；沒掛也會正常回答（提示是條件式的）。
+
+在跑 bridge 的機器上為 Claude Code 加上這個 MCP server：
+
+```bash
+claude mcp add --transport http google-chat https://chatmcp.googleapis.com/mcp/v1
+```
+
+首次使用會走 OAuth 授權（需先在同一個 GCP 專案啟用 Chat MCP API 並設定 OAuth
+consent screen 與 OAuth client，scope 為 `chat.spaces.readonly`、
+`chat.memberships.readonly`、`chat.messages.readonly`、`chat.messages.create`、
+`chat.users.readstate.readonly`）。詳見官方指南：
+https://developers.google.com/workspace/chat/api/guides/configure-mcp-server
+
+注意：MCP 的 `send_message` 以使用者本人名義發言。bridge 注入的提示已明確禁止
+後端用它回覆——回覆一律由 bridge 以 app 身分（`chat.bot`）送出。
+
 ## 平台差異備忘
 
 | 面向 | Discord (bot.py) | Google Chat (gchat_bridge.py) |

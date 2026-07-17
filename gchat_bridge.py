@@ -77,6 +77,11 @@ GCHAT_SESSION_SCOPE = os.getenv("GCHAT_SESSION_SCOPE", "auto").strip().lower()
 if GCHAT_SESSION_SCOPE not in {"auto", "thread", "space"}:
     sys.exit(f"Invalid GCHAT_SESSION_SCOPE {GCHAT_SESSION_SCOPE!r}: use auto, thread, or space")
 
+# On new sessions, hint the backend to restore prior context via the Google Chat
+# MCP server (chatmcp.googleapis.com) if the user has it configured in Claude Code.
+# Set to 0 to disable. See docs/gchat-setup.md.
+GCHAT_MCP_CONTEXT_HINT = os.getenv("GCHAT_MCP_CONTEXT_HINT", "1") == "1"
+
 # Chat text messages cap at 32,000 bytes; chunk_text counts chars, so stay
 # conservative for CJK (3 bytes/char in UTF-8): 8,000 chars ≈ max 24 KB.
 GCHAT_CHUNK = int(os.getenv("GCHAT_CHUNK", "8000"))
@@ -171,6 +176,31 @@ def markdown_to_gchat(text: str) -> str:
     return "".join(parts)
 
 
+def _make_session_instruction(space_name: str, thread_name: str | None) -> str:
+    """System hint injected once on the first turn of a new session (mirrors
+    bot.py's _make_session_instruction, which uses the discord-context skill).
+
+    Phrased conditionally so it degrades gracefully when the backend has no
+    Google Chat MCP server configured.
+    """
+    if not GCHAT_MCP_CONTEXT_HINT or not space_name:
+        return ""
+    where = f"space: {space_name}"
+    if thread_name:
+        where += f", thread: {thread_name}"
+    target = thread_name or space_name
+    return (
+        f"[System: This is a new session bridged from Google Chat ({where}). "
+        "If Google Chat MCP tools (list_messages / search_messages / "
+        "search_conversations) are available and the task references prior "
+        "discussion you lack context for, first restore it by calling "
+        f"list_messages for {target}, then respond. "
+        "If those tools are unavailable, respond directly. "
+        "Never use an MCP send_message tool to reply — the bridge delivers "
+        "your response itself.]\n\n"
+    )
+
+
 def extract_prompt(event: dict) -> str:
     """User text with the leading @mention already stripped (argumentText)."""
     msg = event.get("message", {})
@@ -223,11 +253,19 @@ async def send_message(space_name: str, text: str, thread_name: str | None) -> N
 
 # ── backend orchestration (same semantics as bot.run_claude) ─────────────────
 
-async def run_ai(prompt: str, session_key: str, extra_args: list[str] | None = None) -> str:
+async def run_ai(
+    prompt: str,
+    session_key: str,
+    extra_args: list[str] | None = None,
+    instruction: str = "",
+) -> str:
     session_id = _sessions.get(session_key)
 
+    # Inject the context-restore instruction once on the first turn of a new session
+    send_prompt = prompt if session_id else instruction + prompt
+
     reply = await bridge_core.run_backend(
-        prompt,
+        send_prompt,
         backend_bin=CLAUDE_BIN,
         base_args=CLAUDE_EXTRA_ARGS,
         model=_session_model.get(session_key),
@@ -240,7 +278,7 @@ async def run_ai(prompt: str, session_key: str, extra_args: list[str] | None = N
     if reply.stale_session:
         _sessions.pop(session_key, None)
         _save_sessions()
-        return await run_ai(prompt, session_key, extra_args=extra_args)
+        return await run_ai(prompt, session_key, extra_args=extra_args, instruction=instruction)
 
     if reply.session_id:
         _sessions[session_key] = reply.session_id
@@ -335,7 +373,12 @@ async def handle_event(event: dict) -> None:
         prompt = f"[{speaker}] {prompt}"
 
     log.info(f"Request from {speaker} [{session_key}] turn {current_turn}/{MAX_TURNS}: {content[:80]}")
-    reply = await run_ai(prompt, session_key, extra_args=extra_args)
+    reply = await run_ai(
+        prompt,
+        session_key,
+        extra_args=extra_args,
+        instruction=_make_session_instruction(space_name, thread_name),
+    )
     await send_message(space_name, reply, thread_name)
 
 

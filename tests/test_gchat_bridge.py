@@ -116,6 +116,30 @@ class TestDedup(unittest.TestCase):
         self.assertFalse(gb.is_duplicate("m0"))  # evicted → treated as new
 
 
+class TestSessionInstruction(unittest.TestCase):
+    def test_contains_space_and_thread(self):
+        with patch.object(gb, "GCHAT_MCP_CONTEXT_HINT", True):
+            instr = gb._make_session_instruction("spaces/AAA", "spaces/AAA/threads/TTT")
+        self.assertIn("spaces/AAA", instr)
+        self.assertIn("spaces/AAA/threads/TTT", instr)
+        self.assertIn("list_messages", instr)
+
+    def test_no_thread_targets_space(self):
+        with patch.object(gb, "GCHAT_MCP_CONTEXT_HINT", True):
+            instr = gb._make_session_instruction("spaces/AAA", None)
+        self.assertIn("list_messages for spaces/AAA", instr)
+
+    def test_disabled_returns_empty(self):
+        with patch.object(gb, "GCHAT_MCP_CONTEXT_HINT", False):
+            self.assertEqual(gb._make_session_instruction("spaces/AAA", None), "")
+
+    def test_forbids_mcp_send(self):
+        """The hint must stop the backend replying via MCP as the human user."""
+        with patch.object(gb, "GCHAT_MCP_CONTEXT_HINT", True):
+            instr = gb._make_session_instruction("spaces/AAA", None)
+        self.assertIn("Never use an MCP send_message", instr)
+
+
 class TestExtractPrompt(unittest.TestCase):
     def test_argument_text_preferred(self):
         ev = _event(text="@bot do this", argument_text="  do this  ")
