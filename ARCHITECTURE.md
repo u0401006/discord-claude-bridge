@@ -68,6 +68,7 @@ Main process. Responsibilities:
 - `turn_counts`: `{session_key → int}` — survives restart
 - `stopped_sessions`: `[session_key, …]` — survives restart
 - `session_models`: `{session_key → model}` — `!model` overrides survive restart
+- `session_workdirs`: `{session_key → path}` — `[[ws:path]]` overrides survive restart
 
 **Ephemeral state** (lost on restart, by design):
 - `_rate_buckets`: sliding-window rate limiter
@@ -107,6 +108,16 @@ Direct OpenAI API adapter (no CLI required). Same interface contract as `codex-a
 - **SEND_FILE**: `_validate_send_file()` resolves `realpath`, checks the result is inside `SEND_FILE_ALLOWED_DIRS` (default: `WORKING_DIR`), and verifies the extension is in `SEND_FILE_ALLOWED_EXTS`. Paths that escape these constraints are silently dropped and logged as warnings.
 - **Permissions**: `--dangerously-skip-permissions` is **not** a default; callers must set it explicitly via `CLAUDE_EXTRA_ARGS`. If it is set while `ALLOWED_USER_IDS` is empty, the bot refuses to start (`UNSAFE_ALLOW_ALL_USERS=1` overrides).
 - **Channel/user guards**: evaluated before any AI call; both allow-list and deny-list supported.
+- **Credential isolation** (per OpenAB's trust model): backend subprocesses run with a
+  filtered environment (`bridge_core.build_backend_env`) — `DISCORD_TOKEN`,
+  `OPENAI_API_KEY`, and `GOOGLE_APPLICATION_CREDENTIALS` are stripped by default, so a
+  prompt-injected agent cannot `printenv` frontend secrets. Backends authenticate
+  independently (claude → `~/.claude`, codex → `~/.codex`); `BACKEND_ENV_PASS`
+  re-allows specific vars when a backend genuinely needs them.
+- **Working-directory directive**: `[[ws:path]]` (borrowed from OpenAB) sets a
+  per-session workdir; validated via realpath — must exist, resolve inside
+  `WS_ALLOWED_DIRS` (default: home), symlink escapes rejected. Cleared on `!reset`,
+  persisted in the session envelope (`session_workdirs`).
 - **Task state trust**: `fetch_task_state()` only accepts `📋 [TASK STATE]` messages authored by bots — a human pasting the marker cannot inject content into other sessions.
 - **Attachments**: saved under `ATTACH_DIR` with a random prefix + basename only (no traversal, no cross-user overwrites); uploads over `ATTACH_MAX_BYTES` are skipped.
 - **Model override**: `!model` accepts alias-listed models only.

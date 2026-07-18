@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bridge_core  # noqa: E402
@@ -136,6 +137,77 @@ class TestStreaming(unittest.IsolatedAsyncioTestCase):
 class TestCancelBackend(unittest.TestCase):
     def test_unknown_key_returns_false(self):
         self.assertFalse(bridge_core.cancel_backend("nope"))
+
+
+class TestBuildBackendEnv(unittest.TestCase):
+    def test_frontend_secrets_stripped(self):
+        with unittest.mock.patch.dict(os.environ, {
+            "DISCORD_TOKEN": "secret", "OPENAI_API_KEY": "sk-x", "PATH": "/usr/bin",
+        }):
+            env = bridge_core.build_backend_env()
+        self.assertNotIn("DISCORD_TOKEN", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertIn("PATH", env)  # normal vars pass through
+
+    def test_extra_pass_reallows(self):
+        """openai-adapter backend needs its key: BACKEND_ENV_PASS=OPENAI_API_KEY."""
+        with unittest.mock.patch.dict(os.environ, {
+            "DISCORD_TOKEN": "secret", "OPENAI_API_KEY": "sk-x",
+        }):
+            env = bridge_core.build_backend_env(extra_pass="OPENAI_API_KEY")
+        self.assertIn("OPENAI_API_KEY", env)
+        self.assertNotIn("DISCORD_TOKEN", env)
+
+    def test_extra_deny(self):
+        with unittest.mock.patch.dict(os.environ, {"MY_SECRET": "x"}):
+            env = bridge_core.build_backend_env(extra_deny="MY_SECRET")
+        self.assertNotIn("MY_SECRET", env)
+
+
+class TestWsDirective(unittest.TestCase):
+    def test_parse_with_task(self):
+        content, ws = bridge_core.parse_ws_directive("[[ws:~/proj]] fix the bug")
+        self.assertEqual(content, "fix the bug")
+        self.assertEqual(ws, "~/proj")
+
+    def test_parse_directive_only(self):
+        content, ws = bridge_core.parse_ws_directive("[[ws:/tmp/x]]")
+        self.assertEqual(content, "")
+        self.assertEqual(ws, "/tmp/x")
+
+    def test_no_directive(self):
+        content, ws = bridge_core.parse_ws_directive("hello")
+        self.assertEqual(content, "hello")
+        self.assertIsNone(ws)
+
+
+class TestValidateWorkdir(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.sub = os.path.join(self.root, "proj")
+        os.mkdir(self.sub)
+
+    def test_dir_inside_root_ok(self):
+        self.assertEqual(
+            bridge_core.validate_workdir(self.sub, [self.root]),
+            os.path.realpath(self.sub),
+        )
+
+    def test_traversal_rejected(self):
+        evil = os.path.join(self.sub, "..", "..")
+        self.assertIsNone(bridge_core.validate_workdir(evil, [self.root]))
+
+    def test_outside_root_rejected(self):
+        self.assertIsNone(bridge_core.validate_workdir("/etc", [self.root]))
+
+    def test_nonexistent_rejected(self):
+        ghost = os.path.join(self.root, "nope")
+        self.assertIsNone(bridge_core.validate_workdir(ghost, [self.root]))
+
+    def test_symlink_escape_rejected(self):
+        link = os.path.join(self.root, "link")
+        os.symlink("/etc", link)
+        self.assertIsNone(bridge_core.validate_workdir(link, [self.root]))
 
 
 class TestRunBackendCancel(unittest.IsolatedAsyncioTestCase):

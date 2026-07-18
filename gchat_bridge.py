@@ -59,6 +59,15 @@ WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 CLAUDE_EXTRA_ARGS: list[str] = [a for a in os.getenv("CLAUDE_EXTRA_ARGS", "").split() if a]
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))
+# Credential isolation: backend subprocesses never see frontend secrets
+_BACKEND_ENV = bridge_core.build_backend_env(
+    extra_deny=os.getenv("BACKEND_ENV_DENY", ""),
+    extra_pass=os.getenv("BACKEND_ENV_PASS", ""),
+)
+# [[ws:path]] directive roots (colon-separated; default: user home)
+WS_ALLOWED_DIRS: list[str] = [
+    d for d in os.getenv("WS_ALLOWED_DIRS", "~").split(":") if d.strip()
+]
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 
@@ -95,12 +104,13 @@ _LOG_DIR = os.path.dirname(
 SESSIONS_FILE = os.getenv("GCHAT_SESSIONS_FILE", os.path.join(_LOG_DIR, "gchat-sessions.json"))
 
 # ── state (same envelope as bot.py, separate file) ───────────────────────────
-_sessions, _tc, _ss, _sm = bridge_core.load_sessions(SESSIONS_FILE)
+_sessions, _tc, _ss, _sm, _swd = bridge_core.load_sessions(SESSIONS_FILE)
 _sessions: dict[str, str] = _sessions          # type: ignore[no-redef]
 _turn_counts = defaultdict(int, _tc)
 _stopped_sessions: set[str] = _ss
 _session_model: dict[str, str] = _sm
-del _tc, _ss, _sm
+_session_workdir: dict[str, str] = _swd
+del _tc, _ss, _sm, _swd
 
 _rate_limiter = bridge_core.RateLimiter(RATE_LIMIT_PER_MIN)
 _limit_notified: set[str] = set()
@@ -116,7 +126,8 @@ _last_send: dict[str, float] = {}
 
 def _save_sessions() -> None:
     bridge_core.save_sessions(
-        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions, _session_model
+        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions,
+        _session_model, _session_workdir,
     )
 
 
@@ -271,9 +282,10 @@ async def run_ai(
         model=_session_model.get(session_key),
         extra_args=extra_args or (),
         resume=session_id,
-        cwd=WORKING_DIR,
+        cwd=_session_workdir.get(session_key, WORKING_DIR),
         timeout=TIMEOUT,
         proc_key=session_key,
+        env=_BACKEND_ENV,
     )
 
     if reply.cancelled:
@@ -317,11 +329,30 @@ async def handle_event(event: dict) -> None:
 
     session_key = session_key_for(event)
 
+    # [[ws:path]] control directive: set this session's working directory
+    content, ws_path = bridge_core.parse_ws_directive(content)
+    if ws_path is not None:
+        real = bridge_core.validate_workdir(ws_path, WS_ALLOWED_DIRS)
+        if real is None:
+            await send_message(
+                space_name,
+                f"無效的工作目錄 `{ws_path}`（必須是存在的目錄，且位於允許範圍內）",
+                thread_name,
+            )
+            return
+        _session_workdir[session_key] = real
+        _save_sessions()
+        log.info(f"Workdir for {session_key}: {real}")
+        await send_message(space_name, f"工作目錄已設為 `{real}`", thread_name)
+        if not content:
+            return  # directive-only message
+
     if content == "!reset":
         _sessions.pop(session_key, None)
         _turn_counts.pop(session_key, None)
         _stopped_sessions.discard(session_key)
         _limit_notified.discard(session_key)
+        _session_workdir.pop(session_key, None)
         _save_sessions()
         await send_message(space_name, "Session cleared.", thread_name)
         return
@@ -343,6 +374,7 @@ async def handle_event(event: dict) -> None:
             f"- 後端 session: `{session_id[:8] + '…' if session_id else '尚未建立'}`",
             f"- 輪數: {_turn_counts.get(session_key, 0)}/{MAX_TURNS}",
             f"- 模型: `{_session_model.get(session_key, 'default')}`",
+            f"- 工作目錄: `{_session_workdir.get(session_key, WORKING_DIR)}`",
         ]
         await send_message(space_name, "\n".join(lines), thread_name)
         return
@@ -353,6 +385,7 @@ async def handle_event(event: dict) -> None:
             "`!reset` — 清除 session，重新開始",
             "`!cancel` — 中斷進行中的執行（session 保留）",
             "`!status` — 顯示目前 session 狀態",
+            "`[[ws:路徑]]` — 設定本 session 的工作目錄",
             "",
             "*工作模式*（`!cmd <task>`）",
         ]

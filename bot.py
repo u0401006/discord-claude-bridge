@@ -75,6 +75,18 @@ SESSION_SCOPE = os.getenv("SESSION_SCOPE", "thread").strip().lower()
 if SESSION_SCOPE not in {"thread", "channel", "user"}:
     sys.exit(f"Invalid SESSION_SCOPE {SESSION_SCOPE!r}: use thread, channel, or user")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
+# Credential isolation: backend subprocesses get a filtered environment —
+# frontend secrets (DISCORD_TOKEN etc.) are never printenv-able by the agent.
+# BACKEND_ENV_PASS=OPENAI_API_KEY re-allows a var (needed for openai-adapter).
+_BACKEND_ENV = bridge_core.build_backend_env(
+    extra_deny=os.getenv("BACKEND_ENV_DENY", ""),
+    extra_pass=os.getenv("BACKEND_ENV_PASS", ""),
+)
+# [[ws:path]] directive may point the session's working dir anywhere under
+# these roots (colon-separated; default: the user's home, like OpenAB)
+WS_ALLOWED_DIRS: list[str] = [
+    d for d in os.getenv("WS_ALLOWED_DIRS", "~").split(":") if d.strip()
+]
 # Live progress: stream tool activity into an auto-edited Discord message
 # (uses --output-format stream-json; works with the claude CLI and with the
 # bundled adapters — adapters just show no intermediate steps). Default off.
@@ -178,6 +190,7 @@ async def _run_direct_cmd(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=WORKING_DIR,
+            env=_BACKEND_ENV,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -270,17 +283,22 @@ def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str], dict[str
 
 def _save_sessions() -> None:
     bridge_core.save_sessions(
-        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions, _session_model
+        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions,
+        _session_model, _session_workdir,
     )
 
 
-# session tracker — all four structures persisted together across restarts
-_sessions, _tc, _ss, _sm = _load_sessions()
+# per-session working directory override (set via [[ws:path]] directive)
+_session_workdir: dict[str, str] = {}
+
+# session tracker — all five structures persisted together across restarts
+_sessions, _tc, _ss, _sm, _swd = _load_sessions()
 _sessions: dict[str, str] = _sessions          # type: ignore[no-redef]
 _turn_counts = defaultdict(int, _tc)
 _stopped_sessions: set[str] = _ss
 _session_model.update(_sm)
-del _tc, _ss, _sm
+_session_workdir.update(_swd)
+del _tc, _ss, _sm, _swd
 
 
 _rate_limiter = bridge_core.RateLimiter(RATE_LIMIT_PER_MIN)
@@ -441,9 +459,10 @@ async def run_claude(
         model=_session_model.get(session_key),
         extra_args=extra_args or (),
         resume=session_id,
-        cwd=WORKING_DIR,
+        cwd=_session_workdir.get(session_key, WORKING_DIR),
         timeout=TIMEOUT,
         proc_key=session_key,
+        env=_BACKEND_ENV,
     )
     if on_progress is not None:
         reply = await bridge_core.run_backend_streaming(
@@ -727,6 +746,23 @@ async def on_message(message: discord.Message):
 
     session_key = _session_key_for(message.channel, message.author.id)
 
+    # [[ws:path]] control directive: set this session's working directory
+    content, ws_path = bridge_core.parse_ws_directive(content)
+    if ws_path is not None:
+        real = bridge_core.validate_workdir(ws_path, WS_ALLOWED_DIRS)
+        if real is None:
+            await message.channel.send(
+                f"{message.author.mention} 無效的工作目錄 `{ws_path}`"
+                "（必須是存在的目錄，且位於允許範圍內）"
+            )
+            return
+        _session_workdir[session_key] = real
+        _save_sessions()
+        log.info(f"Workdir for {session_key}: {real}")
+        await message.channel.send(f"{message.author.mention} 工作目錄已設為 `{real}`")
+        if not content:
+            return  # directive-only message
+
     if content == "!reset":
         if session_key in _pending:
             _pending.pop(session_key).cancel()
@@ -736,6 +772,7 @@ async def on_message(message: discord.Message):
         _turn_counts.pop(session_key, None)
         _stopped_sessions.discard(session_key)
         _limit_notified.discard(session_key)
+        _session_workdir.pop(session_key, None)
         _save_sessions()
         log.info(f"Session reset for {session_key}")
         await message.channel.send(f"{message.author.mention} Session cleared.")
@@ -827,6 +864,7 @@ async def on_message(message: discord.Message):
             f"- Claude session: `{session_id[:8] + '…' if session_id else '尚未建立'}`",
             f"- 輪數: {turn}/{MAX_TURNS}",
             f"- 模型: `{_session_model.get(session_key, 'default')}`",
+            f"- 工作目錄: `{_session_workdir.get(session_key, WORKING_DIR)}`",
             f"- 狀態: {'已停止（!reset 重啟）' if session_key in _stopped_sessions else '進行中'}",
         ]
         await message.channel.send(f"{message.author.mention}\n" + "\n".join(lines))
@@ -843,6 +881,7 @@ async def on_message(message: discord.Message):
             "`!flush` — 壓縮對話記憶存檔",
             "`!status` — 顯示目前 session 狀態（key / 輪數 / 模型）",
             "`!model <name>` — 切換模型（opus / sonnet / haiku / fable）",
+            "`[[ws:路徑]]` — 設定本 session 的工作目錄（可與任務同一則訊息）",
             "",
             "**工作模式**（`!cmd <task>`，後接任務內容）",
         ]

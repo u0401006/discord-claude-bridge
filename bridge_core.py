@@ -31,6 +31,64 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 
+# ── backend environment (credential isolation) ──────────────────────────────
+# Borrowed from OpenAB's trust model: the bridge resolves its own secrets and
+# the agent subprocess never sees them — backends authenticate independently
+# (claude → ~/.claude, codex → ~/.codex). Frontend secrets must not be
+# printenv-able by a prompt-injected agent.
+
+DEFAULT_ENV_DENY: frozenset[str] = frozenset({
+    "DISCORD_TOKEN",
+    "OPENAI_API_KEY",                  # pass explicitly when using openai-adapter
+    "GOOGLE_APPLICATION_CREDENTIALS",  # gchat frontend's service-account key path
+})
+
+
+def build_backend_env(extra_deny: str = "", extra_pass: str = "") -> dict[str, str]:
+    """Copy of os.environ with frontend secrets stripped.
+
+    extra_deny / extra_pass are comma-separated variable names; pass wins over
+    the default deny list (e.g. BACKEND_ENV_PASS=OPENAI_API_KEY for the
+    openai-adapter backend, which needs the key in its own process).
+    """
+    deny = set(DEFAULT_ENV_DENY)
+    deny.update(v.strip() for v in extra_deny.split(",") if v.strip())
+    deny.difference_update(v.strip() for v in extra_pass.split(",") if v.strip())
+    return {k: v for k, v in os.environ.items() if k not in deny}
+
+
+# ── working-directory directive (OpenAB's [[ws:path]]) ───────────────────────
+
+_WS_DIRECTIVE_RE = re.compile(r"\[\[ws:([^\]]+)\]\]")
+
+
+def parse_ws_directive(content: str) -> tuple[str, str | None]:
+    """Extract a [[ws:path]] control directive. Returns (content_without_it, path).
+    Only the first occurrence counts; the directive is stripped either way."""
+    m = _WS_DIRECTIVE_RE.search(content)
+    if not m:
+        return content, None
+    path = m.group(1).strip()
+    cleaned = _WS_DIRECTIVE_RE.sub("", content).strip()
+    return cleaned, path
+
+
+def validate_workdir(path: str, allowed_roots: list[str]) -> str | None:
+    """OpenAB-style validation: expand, resolve symlinks, require an existing
+    directory inside one of allowed_roots. Returns the realpath, or None."""
+    try:
+        real = os.path.realpath(os.path.expanduser(path.strip()))
+    except Exception:
+        return None
+    if not os.path.isdir(real):
+        return None
+    for root in allowed_roots:
+        r = os.path.realpath(os.path.expanduser(root))
+        if real == r or real.startswith(r + os.sep):
+            return real
+    return None
+
+
 # ── backend invocation (the CLI JSON contract) ───────────────────────────────
 
 @dataclass
@@ -81,10 +139,12 @@ async def run_backend(
     cwd: str | None = None,
     timeout: int = 120,
     proc_key: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> BackendReply:
     """Run one backend call over the CLI JSON contract. No session bookkeeping —
     callers own the session store and decide how to react to stale_session.
-    Pass proc_key to make the invocation cancellable via cancel_backend()."""
+    Pass proc_key to make the invocation cancellable via cancel_backend().
+    Pass env (see build_backend_env) to strip frontend secrets; None inherits."""
     args = [backend_bin, *base_args]
     if model:
         args += ["--model", model]
@@ -98,6 +158,7 @@ async def run_backend(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -202,6 +263,7 @@ async def run_backend_streaming(
     cwd: str | None = None,
     timeout: int = 120,
     proc_key: str | None = None,
+    env: dict[str, str] | None = None,
     on_progress=None,
 ) -> BackendReply:
     """Like run_backend, but via --output-format stream-json: intermediate
@@ -225,6 +287,7 @@ async def run_backend_streaming(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=8 * 1024 * 1024,  # tool results can be huge single lines
@@ -305,7 +368,9 @@ async def run_backend_streaming(
 
 # ── session persistence (shared envelope format) ─────────────────────────────
 
-def load_sessions(path: str) -> tuple[dict[str, str], dict[str, int], set[str], dict[str, str]]:
+def load_sessions(
+    path: str,
+) -> tuple[dict[str, str], dict[str, int], set[str], dict[str, str], dict[str, str]]:
     try:
         with open(path) as f:
             data = json.load(f)
@@ -315,15 +380,17 @@ def load_sessions(path: str) -> tuple[dict[str, str], dict[str, int], set[str], 
             turn_counts = {k: int(v) for k, v in data.get("turn_counts", {}).items()}
             stopped = set(data.get("stopped_sessions", []))
             models = dict(data.get("session_models", {}))
+            workdirs = dict(data.get("session_workdirs", {}))
         else:
             # Legacy format: plain {session_key: session_id}
             sessions = data
             turn_counts = {}
             stopped = set()
             models = {}
-        return sessions, turn_counts, stopped, models
+            workdirs = {}
+        return sessions, turn_counts, stopped, models, workdirs
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}, {}, set(), {}
+        return {}, {}, set(), {}, {}
 
 
 def save_sessions(
@@ -332,6 +399,7 @@ def save_sessions(
     turn_counts: dict[str, int],
     stopped: set[str],
     models: dict[str, str],
+    workdirs: dict[str, str] | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = {
@@ -339,6 +407,7 @@ def save_sessions(
         "turn_counts": dict(turn_counts),
         "stopped_sessions": list(stopped),
         "session_models": models,
+        "session_workdirs": workdirs or {},
     }
     # atomic write: a crash mid-dump must not corrupt the existing file
     tmp_path = path + ".tmp"

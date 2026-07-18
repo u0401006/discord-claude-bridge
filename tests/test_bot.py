@@ -167,33 +167,37 @@ class TestSessionPersistence(unittest.TestCase):
         bot._turn_counts["ch1_u1"] = 7
         bot._stopped_sessions.add("ch1_u2")
         bot._session_model["ch1_u1"] = "claude-sonnet-5"
+        bot._session_workdir["ch1_u1"] = "/tmp/proj"
         bot._save_sessions()
 
-        sessions, turns, stopped, models = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions.get("ch1_u1"), "sess-abc")
         self.assertEqual(turns.get("ch1_u1"), 7)
         self.assertIn("ch1_u2", stopped)
         self.assertEqual(models.get("ch1_u1"), "claude-sonnet-5")
+        self.assertEqual(workdirs.get("ch1_u1"), "/tmp/proj")
 
     def test_legacy_format_backwards_compat(self):
         with open(self.tmp_file, "w") as f:
             json.dump({"ch1_u1": "old-id"}, f)
 
-        sessions, turns, stopped, models = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions["ch1_u1"], "old-id")
         self.assertEqual(turns, {})
         self.assertEqual(stopped, set())
         self.assertEqual(models, {})
+        self.assertEqual(workdirs, {})
 
     def test_empty_file_returns_defaults(self):
         with open(self.tmp_file, "w") as f:
             f.write("")
 
-        sessions, turns, stopped, models = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions, {})
         self.assertEqual(turns, {})
         self.assertEqual(stopped, set())
         self.assertEqual(models, {})
+        self.assertEqual(workdirs, {})
 
     def test_save_is_atomic_no_tmp_left_behind(self):
         bot._sessions["chX_u1"] = "sess-x"

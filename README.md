@@ -46,6 +46,9 @@ All settings are in the `.env` file (or environment variables):
 | `SESSION_SCOPE` | `thread` | `thread` = shared session per thread, per-user in channels; `channel` = shared per channel; `user` = per channel/user pair (legacy) |
 | `CLAUDE_TIMEOUT` | `120` | Subprocess timeout in seconds |
 | `STREAM_PROGRESS` | `0` | `1` streams live tool activity into an auto-edited progress message (recommended with the claude CLI backend) |
+| `BACKEND_ENV_PASS` | — | Comma-separated env vars to re-allow into the backend subprocess (e.g. `OPENAI_API_KEY` for openai-adapter). By default `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` are stripped |
+| `BACKEND_ENV_DENY` | — | Extra env vars to strip from the backend subprocess |
+| `WS_ALLOWED_DIRS` | `~` | Colon-separated roots the `[[ws:path]]` directive may point into |
 | `PROGRESS_EDIT_INTERVAL` | `2.0` | Min seconds between progress-message edits |
 | `ATTACH_DIR` | `/tmp/discord-attachments` | Where user attachments are saved (randomised filenames) |
 | `ATTACH_MAX_BYTES` | `8388608` | Max attachment size (8 MB); larger uploads are skipped |
@@ -64,8 +67,9 @@ All settings are in the `.env` file (or environment variables):
 | `!cancel` | Kill the in-flight backend run (session is kept) |
 | `!stop` | Stop bot from forwarding further replies in this session |
 | `!flush` | Summarise session and persist to disk for future reference |
-| `!status` | Show current session key, scope, turn count, model, and state |
+| `!status` | Show current session key, scope, turn count, model, workdir, and state |
 | `!model <alias>` | Switch model for this session (alias list only; persisted) |
+| `[[ws:path]]` | Set this session's working directory (validated: must exist, inside `WS_ALLOWED_DIRS`, symlinks resolved); may accompany a task in the same message |
 
 ## Backends
 
