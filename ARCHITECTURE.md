@@ -2,21 +2,50 @@
 
 ## Overview
 
-A Discord bot that bridges user messages to AI backends (Claude Code or OpenAI Codex) and returns responses. Each Discord channel/user pair is a persistent session.
+A chat bridge connecting messaging frontends to AI backends. Frontends and backends are independently pluggable around two seams:
+
+1. **Backend seam — the CLI JSON contract.** Every backend is invoked as
+   `<CLAUDE_BIN> [args] [--model M] [--resume ID] --print --output-format json -- <prompt>`
+   and returns `{"result": "...", "session_id": "..."}` on stdout. Anything speaking this
+   contract (claude CLI, codex-adapter.py, openai-adapter.py) works with every frontend
+   with zero changes.
+2. **Shared core — `bridge_core.py`.** Backend invocation, session persistence
+   (atomic envelope), fence-aware chunking, `!cmd` prompt modes, and rate limiting live
+   here. Frontends contain only platform I/O and platform-specific policy.
 
 ```
-Discord
-  │  (message)
-  ▼
-bot.py  ──────────────────► claude CLI  (CLAUDE_BIN, default)
-  │                     or  codex-adapter.py  (via CLAUDE_BIN override)
-  │                     or  openai-adapter.py
+Discord ──── bot.py ───────────┐
+                               ├──► bridge_core.run_backend ──► claude CLI  (CLAUDE_BIN)
+Google Chat ─ gchat_bridge.py ─┘                           or  codex-adapter.py
+   (Pub/Sub pull)                                          or  openai-adapter.py
   │
-  └─ sessions.json  (session IDs + turn counts + stopped flags)
-  └─ memory/<ch>/<thread>/context.md  (flushed summaries)
+  └─ sessions.json / gchat-sessions.json  (session IDs + turns + stopped + models)
+  └─ memory/<ch>/<thread>/context.md  (flushed summaries, Discord only)
 ```
 
 ## Components
+
+### bridge_core.py
+
+Platform-agnostic core: `run_backend()` (one CLI-contract invocation, stale-session
+detection), `run_backend_streaming()` (same via `--output-format stream-json`; surfaces
+tool_use events through an `on_progress` callback, and stays compatible with adapters
+that print a single JSON object), `cancel_backend(proc_key)` (kills the in-flight
+subprocess registered under that key — frontends pass the session key as `proc_key`,
+so `!cancel` terminates the right run), `load_sessions()`/`save_sessions()` (atomic
+envelope), `chunk_text()` (fence-aware, per-platform limit), `CMD_MAP`/`parse_command()`
+(!plan/!think/… modes), `RateLimiter`.
+
+### gchat_bridge.py
+
+Google Chat frontend. Receives MESSAGE events via Cloud Pub/Sub **pull** (outbound gRPC
+only — NAT-friendly, no public endpoint), replies via Chat API `spaces.messages.create`
+(app auth, scope `chat.bot`). Handles at-least-once redelivery (LRU dedup on message
+name), converts backend Markdown to Chat's own syntax, chunks to `GCHAT_CHUNK` chars
+(32,000-byte platform limit) and throttles to the 1 write/s/space quota. Session scope
+`auto`: thread-scoped in threaded spaces, space-scoped in DMs/flat spaces (which mint a
+new thread per message). Sessions persist to `gchat-sessions.json` — a separate file so
+a Discord bridge sharing the directory never clobbers it. Setup: `docs/gchat-setup.md`.
 
 ### bot.py
 
@@ -24,7 +53,7 @@ Main process. Responsibilities:
 
 | Area | Detail |
 |---|---|
-| Session key | `ch{channel_id}_u{user_id}` |
+| Session key | Scope-dependent (`SESSION_SCOPE`): `thread` (default) → `th{thread_id}` inside threads (shared by all participants), `ch{channel_id}_u{user_id}` at channel top level; `channel` → `ch{channel_id}` (shared); `user` → `ch{channel_id}_u{user_id}` (legacy). Shared-scope messages are prefixed `[speaker]` before forwarding. Backend-agnostic: adapters only ever see `--resume <session_id>`. |
 | Debounce | Buffers incoming messages for `DEBOUNCE_SECONDS` before sending to Claude |
 | Rate limiting | `RATE_LIMIT_PER_MIN` per user (sliding window, in-memory) |
 | Turn cap | `MAX_TURNS` per session; saved to disk |
@@ -34,10 +63,12 @@ Main process. Responsibilities:
 | Memory flush | `!flush` summarises session and appends to `memory/<ch>/<thread>/context.md` |
 | Session reset | `!reset` clears session_id, turn count, stopped flag |
 
-**Persisted state** (`sessions.json` envelope):
+**Persisted state** (`sessions.json` envelope, written atomically via temp file + `os.replace`):
 - `sessions`: `{session_key → claude_session_id}`
 - `turn_counts`: `{session_key → int}` — survives restart
 - `stopped_sessions`: `[session_key, …]` — survives restart
+- `session_models`: `{session_key → model}` — `!model` overrides survive restart
+- `session_workdirs`: `{session_key → path}` — `[[ws:path]]` overrides survive restart
 
 **Ephemeral state** (lost on restart, by design):
 - `_rate_buckets`: sliding-window rate limiter
@@ -75,8 +106,21 @@ Direct OpenAI API adapter (no CLI required). Same interface contract as `codex-a
 ## Security model
 
 - **SEND_FILE**: `_validate_send_file()` resolves `realpath`, checks the result is inside `SEND_FILE_ALLOWED_DIRS` (default: `WORKING_DIR`), and verifies the extension is in `SEND_FILE_ALLOWED_EXTS`. Paths that escape these constraints are silently dropped and logged as warnings.
-- **Permissions**: `--dangerously-skip-permissions` is **not** a default; callers must set it explicitly via `CLAUDE_EXTRA_ARGS`.
+- **Permissions**: `--dangerously-skip-permissions` is **not** a default; callers must set it explicitly via `CLAUDE_EXTRA_ARGS`. If it is set while `ALLOWED_USER_IDS` is empty, the bot refuses to start (`UNSAFE_ALLOW_ALL_USERS=1` overrides).
 - **Channel/user guards**: evaluated before any AI call; both allow-list and deny-list supported.
+- **Credential isolation** (per OpenAB's trust model): backend subprocesses run with a
+  filtered environment (`bridge_core.build_backend_env`) — `DISCORD_TOKEN`,
+  `OPENAI_API_KEY`, and `GOOGLE_APPLICATION_CREDENTIALS` are stripped by default, so a
+  prompt-injected agent cannot `printenv` frontend secrets. Backends authenticate
+  independently (claude → `~/.claude`, codex → `~/.codex`); `BACKEND_ENV_PASS`
+  re-allows specific vars when a backend genuinely needs them.
+- **Working-directory directive**: `[[ws:path]]` (borrowed from OpenAB) sets a
+  per-session workdir; validated via realpath — must exist, resolve inside
+  `WS_ALLOWED_DIRS` (default: home), symlink escapes rejected. Cleared on `!reset`,
+  persisted in the session envelope (`session_workdirs`).
+- **Task state trust**: `fetch_task_state()` only accepts `📋 [TASK STATE]` messages authored by bots — a human pasting the marker cannot inject content into other sessions.
+- **Attachments**: saved under `ATTACH_DIR` with a random prefix + basename only (no traversal, no cross-user overwrites); uploads over `ATTACH_MAX_BYTES` are skipped.
+- **Model override**: `!model` accepts alias-listed models only.
 
 ## Runtime management (macOS)
 

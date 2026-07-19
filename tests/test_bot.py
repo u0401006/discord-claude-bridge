@@ -166,30 +166,115 @@ class TestSessionPersistence(unittest.TestCase):
         bot._sessions["ch1_u1"] = "sess-abc"
         bot._turn_counts["ch1_u1"] = 7
         bot._stopped_sessions.add("ch1_u2")
+        bot._session_model["ch1_u1"] = "claude-sonnet-5"
+        bot._session_workdir["ch1_u1"] = "/tmp/proj"
         bot._save_sessions()
 
-        sessions, turns, stopped = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions.get("ch1_u1"), "sess-abc")
         self.assertEqual(turns.get("ch1_u1"), 7)
         self.assertIn("ch1_u2", stopped)
+        self.assertEqual(models.get("ch1_u1"), "claude-sonnet-5")
+        self.assertEqual(workdirs.get("ch1_u1"), "/tmp/proj")
 
     def test_legacy_format_backwards_compat(self):
         with open(self.tmp_file, "w") as f:
             json.dump({"ch1_u1": "old-id"}, f)
 
-        sessions, turns, stopped = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions["ch1_u1"], "old-id")
         self.assertEqual(turns, {})
         self.assertEqual(stopped, set())
+        self.assertEqual(models, {})
+        self.assertEqual(workdirs, {})
 
     def test_empty_file_returns_defaults(self):
         with open(self.tmp_file, "w") as f:
             f.write("")
 
-        sessions, turns, stopped = bot._load_sessions()
+        sessions, turns, stopped, models, workdirs = bot._load_sessions()
         self.assertEqual(sessions, {})
         self.assertEqual(turns, {})
         self.assertEqual(stopped, set())
+        self.assertEqual(models, {})
+        self.assertEqual(workdirs, {})
+
+    def test_save_is_atomic_no_tmp_left_behind(self):
+        bot._sessions["chX_u1"] = "sess-x"
+        bot._save_sessions()
+        self.assertFalse(os.path.exists(self.tmp_file + ".tmp"))
+        with open(self.tmp_file) as f:
+            json.load(f)  # valid JSON
+
+
+# ── session key scoping ───────────────────────────────────────────────────────
+
+
+class _FakeChannel:
+    def __init__(self, id, parent_id=None):
+        self.id = id
+        if parent_id is not None:
+            self.parent_id = parent_id
+
+
+class TestSessionKey(unittest.TestCase):
+    def test_thread_scope_in_thread_is_shared(self):
+        with patch.object(bot, "SESSION_SCOPE", "thread"):
+            thread = _FakeChannel(id=999, parent_id=100)
+            key1 = bot._session_key_for(thread, user_id=1)
+            key2 = bot._session_key_for(thread, user_id=2)
+        self.assertEqual(key1, "th999")
+        self.assertEqual(key1, key2)  # two users in one thread share the session
+        self.assertTrue(bot._is_shared_scope(key1))
+
+    def test_thread_scope_in_channel_is_per_user(self):
+        with patch.object(bot, "SESSION_SCOPE", "thread"):
+            channel = _FakeChannel(id=100)
+            key1 = bot._session_key_for(channel, user_id=1)
+            key2 = bot._session_key_for(channel, user_id=2)
+        self.assertEqual(key1, "ch100_u1")
+        self.assertNotEqual(key1, key2)
+        self.assertFalse(bot._is_shared_scope(key1))
+
+    def test_channel_scope_shared_and_parent_aware(self):
+        with patch.object(bot, "SESSION_SCOPE", "channel"):
+            channel = _FakeChannel(id=100)
+            thread = _FakeChannel(id=999, parent_id=100)
+            self.assertEqual(bot._session_key_for(channel, 1), "ch100")
+            # thread messages map to the parent channel's shared session
+            self.assertEqual(bot._session_key_for(thread, 2), "ch100")
+
+    def test_user_scope_legacy(self):
+        with patch.object(bot, "SESSION_SCOPE", "user"):
+            thread = _FakeChannel(id=999, parent_id=100)
+            self.assertEqual(bot._session_key_for(thread, 1), "ch999_u1")
+
+    def test_instruction_extracts_id_from_all_key_formats(self):
+        for key, expected in [("ch100_u1", "100"), ("th999", "999"), ("ch100", "100")]:
+            instr = bot._make_session_instruction(key)
+            self.assertIn(f"channel {expected}", instr)
+
+
+# ── attachment path sanitisation ──────────────────────────────────────────────
+
+
+class TestAttachmentPath(unittest.TestCase):
+    def test_stays_inside_attach_dir(self):
+        p = bot._attachment_path("../../etc/cron.d/evil")
+        self.assertEqual(os.path.dirname(p), bot.ATTACH_DIR)
+        self.assertTrue(os.path.basename(p).endswith("_evil"))
+
+    def test_backslash_traversal_neutralised(self):
+        p = bot._attachment_path("..\\..\\boot.ini")
+        self.assertEqual(os.path.dirname(p), bot.ATTACH_DIR)
+        self.assertTrue(os.path.basename(p).endswith("_boot.ini"))
+
+    def test_unique_per_call(self):
+        self.assertNotEqual(bot._attachment_path("a.png"), bot._attachment_path("a.png"))
+
+    def test_empty_name_fallback(self):
+        p = bot._attachment_path("...")
+        self.assertEqual(os.path.dirname(p), bot.ATTACH_DIR)
 
 
 if __name__ == "__main__":

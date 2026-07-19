@@ -1,0 +1,4 @@
+# Google Chat frontend (gchat_bridge.py) — Python 3.10+
+python-dotenv>=1.0.0
+google-apps-chat>=0.10.0
+google-cloud-pubsub>=2.21.0

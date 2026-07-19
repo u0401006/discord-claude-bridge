@@ -5,17 +5,19 @@ Discord ↔ Claude Code Bridge
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
 import sys
 import time
 import unicodedata
+import uuid
 from collections import defaultdict
 
 import discord
 from dotenv import load_dotenv
+
+import bridge_core
 
 # 支援 --env /path/to/.env，讓多個 bot 實例共用同一份 bot.py
 _env_path: str | None = None
@@ -59,12 +61,37 @@ WEBHOOK_PASSTHROUGH_IDS: set[int] = {
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 # Extra args prepended to every CLAUDE_BIN call.
-# Claude Code default: --dangerously-skip-permissions
+# Claude Code unattended mode: set --dangerously-skip-permissions explicitly in .env.
 # OpenAI adapter: leave empty or set --model gpt-4o
 CLAUDE_EXTRA_ARGS: list[str] = [
-    a for a in os.getenv("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions").split() if a
+    a for a in os.getenv("CLAUDE_EXTRA_ARGS", "").split() if a
 ]
+# Session scope: how a Discord message maps to a Claude session.
+#   thread  (default) — inside a thread everyone shares one session (th{thread_id});
+#                       top-level channel messages stay per-user (ch{id}_u{uid})
+#   channel           — everyone in a channel shares one session (ch{id})
+#   user              — per channel/user pair (legacy behaviour)
+SESSION_SCOPE = os.getenv("SESSION_SCOPE", "thread").strip().lower()
+if SESSION_SCOPE not in {"thread", "channel", "user"}:
+    sys.exit(f"Invalid SESSION_SCOPE {SESSION_SCOPE!r}: use thread, channel, or user")
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))  # seconds
+# Credential isolation: backend subprocesses get a filtered environment —
+# frontend secrets (DISCORD_TOKEN etc.) are never printenv-able by the agent.
+# BACKEND_ENV_PASS=OPENAI_API_KEY re-allows a var (needed for openai-adapter).
+_BACKEND_ENV = bridge_core.build_backend_env(
+    extra_deny=os.getenv("BACKEND_ENV_DENY", ""),
+    extra_pass=os.getenv("BACKEND_ENV_PASS", ""),
+)
+# [[ws:path]] directive may point the session's working dir anywhere under
+# these roots (colon-separated; default: the user's home, like OpenAB)
+WS_ALLOWED_DIRS: list[str] = [
+    d for d in os.getenv("WS_ALLOWED_DIRS", "~").split(":") if d.strip()
+]
+# Live progress: stream tool activity into an auto-edited Discord message
+# (uses --output-format stream-json; works with the claude CLI and with the
+# bundled adapters — adapters just show no intermediate steps). Default off.
+STREAM_PROGRESS = os.getenv("STREAM_PROGRESS", "0") == "1"
+PROGRESS_EDIT_INTERVAL = float(os.getenv("PROGRESS_EDIT_INTERVAL", "2.0"))
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "5"))
 MAX_TURNS = int(os.getenv("MAX_TURNS_PER_SESSION", "20"))
 TASK_STATE_INTERVAL = int(os.getenv("TASK_STATE_INTERVAL", "5"))  # 0 = disabled
@@ -89,12 +116,16 @@ _SEND_FILE_EXTS: frozenset[str] = frozenset(
     if e.strip()
 )
 
-_LOG_DIR = os.path.dirname(os.path.expanduser(os.getenv("LOG_FILE", "logs/bot.log")))
+# Same default as the logging handler above, so sessions.json/memory live next to the log
+_LOG_DIR = os.path.dirname(
+    os.path.expanduser(os.getenv("LOG_FILE", "~/discord-claude-bridge.log"))
+)
 SESSIONS_FILE = os.path.join(_LOG_DIR, "sessions.json")
 MEMORY_DIR = os.path.join(_LOG_DIR, "memory")
 
-# rate limiter: user_id → list of timestamps
-_rate_buckets: dict[int, list[float]] = defaultdict(list)
+# attachment handling: dedicated dir + size cap (bytes)
+ATTACH_DIR = os.path.expanduser(os.getenv("ATTACH_DIR", "/tmp/discord-attachments"))
+ATTACH_MAX_BYTES = int(os.getenv("ATTACH_MAX_BYTES", str(8 * 1024 * 1024)))
 
 # turn counter / stopped sessions — initialized from disk below (see _load_sessions)
 _turn_counts: dict[str, int] = defaultdict(int)
@@ -106,6 +137,11 @@ _pending_texts: dict[str, list[str]] = defaultdict(list)
 
 # thread redirect: session_key → channel to reply to (updated by on_thread_create)
 _pending_channel: dict[str, discord.abc.Messageable] = {}
+# last buffering author per session — used to redirect only the thread creator's session
+_pending_author: dict[str, int] = {}
+
+# sessions already told they hit MAX_TURNS (avoid repeating the notice every message)
+_limit_notified: set[str] = set()
 
 # token Claude uses to signal conversation end
 _DONE_SIGNAL = "[DONE]"
@@ -116,69 +152,8 @@ _TASK_STATE_MARKER = "📋 [TASK STATE]"
 # per-session model override: session_key → model name
 _session_model: dict[str, str] = {}
 
-# ── CLI command mapping ──────────────────────────────────────────────────────
-# Each entry: "!cmd" → {"prefix": str, "args": list[str], "help": str}
-# - prefix: prepended to the user prompt (system-style instruction)
-# - args: extra CLI flags added to the claude invocation
-# - help: shown in !help output
-# Commands that take remaining text as <task>; standalone commands return immediately.
-
-_CMD_MAP: dict[str, dict] = {
-    "!plan": {
-        "prefix": (
-            "[Mode: Plan] 在動手寫任何程式碼之前，先產出結構化的實作計畫：\n"
-            "1. 目標確認\n2. 子任務拆解（含檔案路徑）\n3. 風險與邊界條件\n4. 驗收標準\n"
-            "計畫完成後停下，等使用者確認才執行。\n\n"
-        ),
-        "args": [],
-        "help": "!plan <task> — 先規劃再執行，等確認後才動手",
-    },
-    "!think": {
-        "prefix": (
-            "[Mode: Deep Think] 這個問題需要深度思考。\n"
-            "請先花時間分析問題的各個面向、可能的方案與 trade-offs，"
-            "再給出你的結論和建議。不急著給答案，品質優先。\n\n"
-        ),
-        "args": [],
-        "help": "!think <task> — 深度思考模式，分析各面向再給結論",
-    },
-    "!review": {
-        "prefix": (
-            "[Mode: Code Review] 請對以下程式碼或變更進行 code review：\n"
-            "- 指出 bug、安全風險、效能問題\n"
-            "- 建議改善方向\n"
-            "- 標明嚴重程度 (critical / warning / suggestion)\n\n"
-        ),
-        "args": [],
-        "help": "!review <code or file> — Code review 模式",
-    },
-    "!debug": {
-        "prefix": (
-            "[Mode: Systematic Debug] 請用系統化方式除錯：\n"
-            "1. 重現問題（確認症狀）\n2. 建立假設\n3. 驗證假設（讀 code / 跑測試）\n"
-            "4. 找到 root cause\n5. 修復並驗證\n"
-            "每一步都回報你的發現。\n\n"
-        ),
-        "args": [],
-        "help": "!debug <問題描述> — 系統化除錯流程",
-    },
-    "!quick": {
-        "prefix": (
-            "[Mode: Quick] 直接執行，不需要解釋過程。"
-            "只回覆結果和必要的 before/after 對比。\n\n"
-        ),
-        "args": [],
-        "help": "!quick <task> — 快速執行，省略解釋",
-    },
-    "!summarize": {
-        "prefix": (
-            "[Mode: Summarize] 請用繁體中文、中央社風格，將以下內容濃縮為 100 字以內摘要。"
-            "只輸出摘要本文。\n\n"
-        ),
-        "args": [],
-        "help": "!summarize <內容> — 中央社風格 100 字摘要",
-    },
-}
+# ── CLI command mapping — shared with all frontends (see bridge_core.CMD_MAP) ─
+_CMD_MAP: dict[str, dict] = bridge_core.CMD_MAP
 
 # Direct CLI commands: these bypass run_claude and call claude subcommands directly.
 # "!discord_cmd" → {"cli": ["subcommand", ...], "help": str}
@@ -215,6 +190,7 @@ async def _run_direct_cmd(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=WORKING_DIR,
+            env=_BACKEND_ENV,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -231,19 +207,29 @@ async def _run_direct_cmd(
         return f"Bridge error: {e}"
 
 
-def _parse_command(content: str) -> tuple[str, list[str]]:
-    """Parse !cmd from content. Returns (modified_content, extra_cli_args).
+_parse_command = bridge_core.parse_command
 
-    If content starts with a mapped !cmd, prepend its prefix and collect extra args.
+
+def _session_key_for(channel, user_id: int) -> str:
+    """Map a Discord channel/author pair to a session key according to SESSION_SCOPE.
+
+    Threads are detected via parent_id (threads have one, regular channels don't).
     """
-    extra_args: list[str] = []
-    for cmd, spec in _CMD_MAP.items():
-        if content == cmd or content.startswith(cmd + " "):
-            task = content[len(cmd):].strip()
-            prefix = spec["prefix"]
-            extra_args = list(spec["args"])
-            return prefix + task, extra_args
-    return content, extra_args
+    ch_id = getattr(channel, "id", 0)
+    parent_id = getattr(channel, "parent_id", None)
+    if SESSION_SCOPE == "thread":
+        if parent_id:
+            return f"th{ch_id}"
+        return f"ch{ch_id}_u{user_id}"
+    if SESSION_SCOPE == "channel":
+        return f"ch{parent_id or ch_id}"
+    return f"ch{ch_id}_u{user_id}"
+
+
+def _is_shared_scope(session_key: str) -> bool:
+    """True if multiple users share this session (no per-user suffix)."""
+    return "_u" not in session_key
+
 
 # silent-ack patterns: any message whose stripped content matches one of these
 # is dropped without calling Claude (covers ASCII and CJK punctuation)
@@ -260,10 +246,9 @@ def _is_punct_only(text: str) -> bool:
 # system instruction injected once at the start of every new session
 def _make_session_instruction(session_key: str) -> str:
     """Build system instructions for a new Claude session (B3: memory hint, B2: discord-context)."""
-    # Extract channel_id from session_key format: ch{channel_id}_u{user_id}
-    channel_id = ""
-    if session_key.startswith("ch") and "_u" in session_key:
-        channel_id = session_key[2:].split("_u")[0]
+    # Extract channel/thread id from session_key formats: ch{id}, th{id}, ch{id}_u{uid}
+    m = re.match(r"^(?:ch|th)(\d+)", session_key)
+    channel_id = m.group(1) if m else ""
 
     done_rule = (
         f"[System: When you consider this conversation complete or the task fully done, "
@@ -291,52 +276,36 @@ def _make_session_instruction(session_key: str) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
-def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str]]:
-    try:
-        with open(SESSIONS_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "sessions" in data:
-            # New envelope format
-            sessions = data["sessions"]
-            turn_counts = {k: int(v) for k, v in data.get("turn_counts", {}).items()}
-            stopped = set(data.get("stopped_sessions", []))
-        else:
-            # Legacy format: plain {session_key: session_id}
-            sessions = data
-            turn_counts = {}
-            stopped = set()
-        return sessions, turn_counts, stopped
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}, {}, set()
+def _load_sessions() -> tuple[dict[str, str], dict[str, int], set[str], dict[str, str]]:
+    # module-level SESSIONS_FILE is read at call time (tests patch it)
+    return bridge_core.load_sessions(SESSIONS_FILE)
 
 
 def _save_sessions() -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(SESSIONS_FILE)), exist_ok=True)
-    data = {
-        "sessions": _sessions,
-        "turn_counts": dict(_turn_counts),
-        "stopped_sessions": list(_stopped_sessions),
-    }
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(data, f)
+    bridge_core.save_sessions(
+        SESSIONS_FILE, _sessions, dict(_turn_counts), _stopped_sessions,
+        _session_model, _session_workdir,
+    )
 
 
-# session tracker — all three dicts persisted together across restarts
-_sessions, _tc, _ss = _load_sessions()
+# per-session working directory override (set via [[ws:path]] directive)
+_session_workdir: dict[str, str] = {}
+
+# session tracker — all five structures persisted together across restarts
+_sessions, _tc, _ss, _sm, _swd = _load_sessions()
 _sessions: dict[str, str] = _sessions          # type: ignore[no-redef]
 _turn_counts = defaultdict(int, _tc)
 _stopped_sessions: set[str] = _ss
-del _tc, _ss
+_session_model.update(_sm)
+_session_workdir.update(_swd)
+del _tc, _ss, _sm, _swd
+
+
+_rate_limiter = bridge_core.RateLimiter(RATE_LIMIT_PER_MIN)
 
 
 def is_rate_limited(user_id: int) -> bool:
-    now = time.monotonic()
-    bucket = _rate_buckets[user_id]
-    _rate_buckets[user_id] = [t for t in bucket if now - t < 60]
-    if len(_rate_buckets[user_id]) >= RATE_LIMIT_PER_MIN:
-        return True
-    _rate_buckets[user_id].append(now)
-    return False
+    return _rate_limiter.is_limited(user_id)
 
 
 intents = discord.Intents.default()
@@ -345,50 +314,13 @@ client = discord.Client(intents=intents)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-
-def _scan_fence(text: str) -> str | None:
-    """Return the currently-open fence lang (empty str for plain ```), or None if closed."""
-    state: str | None = None
-    for line in text.splitlines():
-        m = re.match(r"^```(\w*)$", line.rstrip())
-        if m:
-            state = None if state is not None else m.group(1)
-    return state
+# fence-aware chunking lives in bridge_core (shared by all frontends)
+_scan_fence = bridge_core.scan_fence
 
 
 def chunk_text(text: str, limit: int = DISCORD_CHUNK) -> list[str]:
     """Split text into Discord-safe chunks, closing/reopening code fences at boundaries."""
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-    reopen = ""  # fence re-open header to prepend to next chunk
-
-    while remaining:
-        work = reopen + remaining
-        reopen = ""
-
-        if len(work) <= limit:
-            chunks.append(work)
-            break
-
-        # Leave 4 chars headroom for potential "\n```" close suffix
-        budget = limit - 4
-        nl = work.rfind("\n", 0, budget)
-        cut = nl if nl > budget // 2 else budget  # prefer newline; hard-cut for long lines
-
-        head = work[:cut]
-        remaining = work[cut:].lstrip("\n")
-
-        fence = _scan_fence(head)
-        if fence is not None:
-            head += "\n```"
-            reopen = f"```{fence}\n"
-
-        chunks.append(head)
-
-    return chunks
+    return bridge_core.chunk_text(text, limit)
 
 
 def _should_write_interim_task_state(turn_count: int, interval: int) -> bool:
@@ -403,7 +335,9 @@ async def fetch_task_state(channel: discord.abc.Messageable, max_merge: int = 3)
     found: list[str] = []
     try:
         async for msg in channel.history(limit=50):  # type: ignore[union-attr]
-            if msg.content.startswith(_TASK_STATE_MARKER):
+            # only trust task states authored by bots — humans could spoof the
+            # marker to inject content into other users' new sessions
+            if msg.author.bot and msg.content.startswith(_TASK_STATE_MARKER):
                 found.append(msg.content)
                 if len(found) >= max_merge:
                     break
@@ -424,6 +358,17 @@ async def write_task_state(channel: discord.abc.Messageable, bot_name: str, summ
         log.info(f"Task state written to channel by {bot_name}")
     except Exception as e:
         log.warning(f"write_task_state failed: {e}")
+
+
+def _attachment_path(filename: str) -> str:
+    """Build a collision-free save path inside ATTACH_DIR for an uploaded attachment.
+
+    The client-supplied filename is reduced to its basename (no path components can
+    escape ATTACH_DIR) and prefixed with a random token so concurrent users can
+    never overwrite each other's uploads.
+    """
+    safe = os.path.basename(filename.replace("\\", "/")).strip() or "attachment"
+    return os.path.join(ATTACH_DIR, f"{uuid.uuid4().hex[:8]}_{safe}")
 
 
 def _validate_send_file(path: str) -> str | None:
@@ -452,79 +397,93 @@ def _validate_send_file(path: str) -> str | None:
     return real
 
 
+class _ProgressReporter:
+    """Streams backend tool activity into one auto-edited Discord message."""
+
+    def __init__(self, channel: discord.abc.Messageable, max_lines: int = 6):
+        self.channel = channel
+        self.max_lines = max_lines
+        self.msg: discord.Message | None = None
+        self.steps: list[str] = []
+        self.count = 0
+        self.start = time.monotonic()
+        self._last_edit = 0.0
+
+    def _render(self, header: str) -> str:
+        lines = "\n".join(f"▸ {s}" for s in self.steps[-self.max_lines:])
+        text = f"{header}（{self.count} 步，{int(time.monotonic() - self.start)}s）"
+        if lines:
+            text += f"\n```\n{lines}\n```"
+        return text[:1900]
+
+    async def on_step(self, desc: str) -> None:
+        self.count += 1
+        self.steps.append(desc)
+        now = time.monotonic()
+        try:
+            if self.msg is None:
+                self.msg = await self.channel.send(self._render("⏳ 執行中"))  # type: ignore[union-attr]
+                self._last_edit = now
+            elif now - self._last_edit >= PROGRESS_EDIT_INTERVAL:
+                await self.msg.edit(content=self._render("⏳ 執行中"))
+                self._last_edit = now
+        except Exception as e:  # progress UI must never break the run
+            log.debug(f"progress update failed: {e}")
+
+    async def finish(self, cancelled: bool = False) -> None:
+        if self.msg is None:
+            return
+        header = "⛔ 已取消" if cancelled else "✅ 完成"
+        try:
+            elapsed = int(time.monotonic() - self.start)
+            await self.msg.edit(content=f"{header}（{self.count} 步，{elapsed}s）")
+        except Exception as e:
+            log.debug(f"progress finish failed: {e}")
+
+
 async def run_claude(
-    prompt: str, session_key: str, extra_args: list[str] | None = None
+    prompt: str,
+    session_key: str,
+    extra_args: list[str] | None = None,
+    on_progress=None,
 ) -> str:
+    """Returns the backend reply text; empty string means the run was cancelled."""
     session_id = _sessions.get(session_key)
 
     # Inject exit-signal instruction once on the first turn of a new session
-    if not session_id:
-        prompt = _make_session_instruction(session_key) + prompt
+    send_prompt = prompt if session_id else _make_session_instruction(session_key) + prompt
 
-    args = [CLAUDE_BIN] + CLAUDE_EXTRA_ARGS
-    # per-session model override
-    model = _session_model.get(session_key)
-    if model:
-        args += ["--model", model]
-    if extra_args:
-        args += extra_args
-    if session_id:
-        args += ["--resume", session_id]
-    args += ["--print", "--output-format", "json", "--", prompt]
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=WORKING_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    kwargs = dict(
+        backend_bin=CLAUDE_BIN,
+        base_args=CLAUDE_EXTRA_ARGS,
+        model=_session_model.get(session_key),
+        extra_args=extra_args or (),
+        resume=session_id,
+        cwd=_session_workdir.get(session_key, WORKING_DIR),
+        timeout=TIMEOUT,
+        proc_key=session_key,
+        env=_BACKEND_ENV,
+    )
+    if on_progress is not None:
+        reply = await bridge_core.run_backend_streaming(
+            send_prompt, on_progress=on_progress, **kwargs
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return f"Timeout after {TIMEOUT}s"
+    else:
+        reply = await bridge_core.run_backend(send_prompt, **kwargs)
 
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            # 失效 session：清除舊 ID 並重試一次（不帶 --resume）
-            if session_id and "No conversation found" in err:
-                _sessions.pop(session_key, None)
-                _save_sessions()
-                return await run_claude(prompt, session_key)
-            # Claude CLI outputs errors as JSON to stdout (not stderr) on some failures
-            raw_out = stdout.decode().strip()
-            human_reason = ""
-            if raw_out:
-                try:
-                    out_data = json.loads(raw_out)
-                    result_msg = out_data.get("result", "")
-                    api_status = out_data.get("api_error_status")
-                    if api_status == 429 or "session limit" in result_msg.lower():
-                        human_reason = f"Claude session limit 已達上限。{result_msg}"
-                    elif result_msg:
-                        human_reason = result_msg
-                except json.JSONDecodeError:
-                    human_reason = raw_out[:500]
-            detail = human_reason or err or "(no detail)"
-            log.error(f"claude exit {proc.returncode}: {detail[:200]}")
-            return f"```\nError (exit {proc.returncode}):\n{detail[:1800]}\n```"
+    if reply.cancelled:
+        return ""
 
-        raw = stdout.decode().strip()
-        try:
-            data = json.loads(raw)
-            new_id: str | None = data.get("session_id")
-            if new_id:
-                _sessions[session_key] = new_id
-                _save_sessions()
-            return data.get("result") or "(no output)"
-        except json.JSONDecodeError:
-            return raw or "(no output)"
+    # 失效 session：清除舊 ID 並重試一次（不帶 --resume，重新注入 instruction）
+    if reply.stale_session:
+        _sessions.pop(session_key, None)
+        _save_sessions()
+        return await run_claude(prompt, session_key, extra_args=extra_args, on_progress=on_progress)
 
-    except FileNotFoundError:
-        return f"`{CLAUDE_BIN}` not found. Set CLAUDE_BIN in .env."
-    except Exception as e:
-        return f"Bridge error: {e}"
+    if reply.session_id:
+        _sessions[session_key] = reply.session_id
+        _save_sessions()
+    return reply.text
 
 
 async def _flush(
@@ -540,6 +499,7 @@ async def _flush(
 
     combined = "\n".join(_pending_texts.pop(session_key, []))
     _pending.pop(session_key, None)
+    _pending_author.pop(session_key, None)
 
     if not combined:
         return
@@ -565,6 +525,13 @@ async def _flush(
     current_turn = _turn_counts[session_key]
 
     if current_turn > MAX_TURNS:
+        # tell the user once instead of silently swallowing their messages
+        if session_key not in _limit_notified and not is_bot_author:
+            _limit_notified.add(session_key)
+            await channel.send(  # type: ignore[union-attr]
+                f"{author.mention} 本對話已達上限 {MAX_TURNS} 輪，訊息不會再轉給 Claude。"
+                "輸入 `!reset` 開啟新 session。"
+            )
         return
 
     log.info(
@@ -573,7 +540,18 @@ async def _flush(
     )
 
     async with channel.typing():  # type: ignore[arg-type]
-        reply = await run_claude(combined, session_key, extra_args=extra_args)
+        if STREAM_PROGRESS and not is_bot_author:
+            reporter = _ProgressReporter(channel)
+            reply = await run_claude(
+                combined, session_key, extra_args=extra_args, on_progress=reporter.on_step
+            )
+            await reporter.finish(cancelled=(reply == ""))
+        else:
+            reply = await run_claude(combined, session_key, extra_args=extra_args)
+
+    # cancelled via !cancel — the cancel handler already confirmed to the user
+    if reply == "":
+        return
 
     # Detect Claude's self-exit signal
     if _DONE_SIGNAL in reply:
@@ -667,9 +645,19 @@ async def on_ready():
 
 @client.event
 async def on_thread_create(thread: discord.Thread) -> None:
-    """Redirect pending session replies into a newly created thread."""
+    """Redirect pending session replies into a newly created thread.
+
+    Only the thread creator's own pending session is redirected — otherwise a
+    thread created by user A would hijack user B's in-flight reply.
+    """
+    owner_id = getattr(thread, "owner_id", None)
+    if owner_id is None:
+        return
     for sk, ch in list(_pending_channel.items()):
-        if getattr(ch, "id", None) == thread.parent_id:
+        if (
+            getattr(ch, "id", None) == thread.parent_id
+            and _pending_author.get(sk) == owner_id
+        ):
             _pending_channel[sk] = thread
             log.info(f"Thread redirect: {sk} → thread {thread.id} ({thread.name!r})")
 
@@ -715,15 +703,22 @@ async def on_message(message: discord.Message):
     if content.startswith(_TASK_STATE_MARKER):
         return
 
-    # Handle file attachments: download and save to /tmp; append text content for .txt files
+    # Handle file attachments: download into ATTACH_DIR; append text content for .txt files
     IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     TEXT_EXTS  = {'.txt'}
     attachment_texts = []
     if message.attachments:
         import aiohttp
+        os.makedirs(ATTACH_DIR, exist_ok=True)
         for att in message.attachments:
+            if att.size and att.size > ATTACH_MAX_BYTES:
+                attachment_texts.append(
+                    f"\n\n[附件 {att.filename} 超過大小上限 "
+                    f"{ATTACH_MAX_BYTES // (1024 * 1024)}MB，已略過]"
+                )
+                continue
             ext = '.' + att.filename.rsplit('.', 1)[-1].lower() if '.' in att.filename else ''
-            tmp_path = f"/tmp/discord_attach_{att.filename}"
+            tmp_path = _attachment_path(att.filename)
             try:
                 async with aiohttp.ClientSession() as http:
                     async with http.get(att.url) as resp:
@@ -731,7 +726,7 @@ async def on_message(message: discord.Message):
                         with open(tmp_path, 'wb') as f:
                             f.write(raw)
                 if ext in IMAGE_EXTS:
-                    attachment_texts.append(f"\n\n[圖片附件：{att.filename}，已存至 {tmp_path}]")
+                    attachment_texts.append(f"\n\n[圖片附件：{att.filename}，已存至 {tmp_path}，可直接 Read 該檔案]")
                 elif ext in TEXT_EXTS:
                     text = raw.decode('utf-8', errors='replace')
                     attachment_texts.append(
@@ -749,18 +744,51 @@ async def on_message(message: discord.Message):
 
     content = re.sub(r'^(<@!?\d+>\s*)+', '', content).strip()
 
-    session_key = f"ch{message.channel.id}_u{message.author.id}"
+    session_key = _session_key_for(message.channel, message.author.id)
+
+    # [[ws:path]] control directive: set this session's working directory
+    content, ws_path = bridge_core.parse_ws_directive(content)
+    if ws_path is not None:
+        real = bridge_core.validate_workdir(ws_path, WS_ALLOWED_DIRS)
+        if real is None:
+            await message.channel.send(
+                f"{message.author.mention} 無效的工作目錄 `{ws_path}`"
+                "（必須是存在的目錄，且位於允許範圍內）"
+            )
+            return
+        _session_workdir[session_key] = real
+        _save_sessions()
+        log.info(f"Workdir for {session_key}: {real}")
+        await message.channel.send(f"{message.author.mention} 工作目錄已設為 `{real}`")
+        if not content:
+            return  # directive-only message
 
     if content == "!reset":
         if session_key in _pending:
             _pending.pop(session_key).cancel()
         _pending_texts.pop(session_key, None)
+        _pending_author.pop(session_key, None)
         _sessions.pop(session_key, None)
         _turn_counts.pop(session_key, None)
         _stopped_sessions.discard(session_key)
+        _limit_notified.discard(session_key)
+        _session_workdir.pop(session_key, None)
         _save_sessions()
         log.info(f"Session reset for {session_key}")
         await message.channel.send(f"{message.author.mention} Session cleared.")
+        return
+
+    if content == "!cancel":
+        # drop any buffered-but-unsent messages first
+        if session_key in _pending:
+            _pending.pop(session_key).cancel()
+        _pending_texts.pop(session_key, None)
+        _pending_author.pop(session_key, None)
+        if bridge_core.cancel_backend(session_key):
+            log.info(f"Cancelled in-flight backend run for {session_key}")
+            await message.channel.send(f"{message.author.mention} ⛔ 已中斷目前執行。session 保留，可直接繼續對話。")
+        else:
+            await message.channel.send(f"{message.author.mention} 沒有進行中的任務。")
         return
 
     if content == "!stop":
@@ -810,12 +838,36 @@ async def on_message(message: discord.Message):
             return
         if arg == "reset":
             _session_model.pop(session_key, None)
+            _save_sessions()
             await message.channel.send(f"{message.author.mention} 已恢復預設模型。")
             return
-        resolved = _MODEL_ALIASES.get(arg.lower(), arg)
+        resolved = _MODEL_ALIASES.get(arg.lower())
+        if not resolved:
+            aliases = ", ".join(f"`{k}`" for k in _MODEL_ALIASES)
+            await message.channel.send(
+                f"{message.author.mention} 未知的模型 `{arg}`。可用別名：{aliases}，或 `!model reset`"
+            )
+            return
         _session_model[session_key] = resolved
+        _save_sessions()
         await message.channel.send(f"{message.author.mention} 本 session 模型已切換為 `{resolved}`")
         log.info(f"Model override for {session_key}: {resolved}")
+        return
+
+    if content == "!status":
+        session_id = _sessions.get(session_key)
+        turn = _turn_counts.get(session_key, 0)
+        shared = "共享（此範圍內所有人同一對話）" if _is_shared_scope(session_key) else "個人（每人獨立對話）"
+        lines = [
+            "**Session 狀態**",
+            f"- session key: `{session_key}`（scope: `{SESSION_SCOPE}`，{shared}）",
+            f"- Claude session: `{session_id[:8] + '…' if session_id else '尚未建立'}`",
+            f"- 輪數: {turn}/{MAX_TURNS}",
+            f"- 模型: `{_session_model.get(session_key, 'default')}`",
+            f"- 工作目錄: `{_session_workdir.get(session_key, WORKING_DIR)}`",
+            f"- 狀態: {'已停止（!reset 重啟）' if session_key in _stopped_sessions else '進行中'}",
+        ]
+        await message.channel.send(f"{message.author.mention}\n" + "\n".join(lines))
         return
 
     if content == "!help":
@@ -824,9 +876,12 @@ async def on_message(message: discord.Message):
             "",
             "**Session 控制**",
             "`!reset` — 清除 session，重新開始",
+            "`!cancel` — 中斷進行中的執行（session 保留）",
             "`!stop` — 停止 Claude 回應（bot 訊息被擋下）",
             "`!flush` — 壓縮對話記憶存檔",
-            "`!model <name>` — 切換模型（opus / sonnet / haiku）",
+            "`!status` — 顯示目前 session 狀態（key / 輪數 / 模型）",
+            "`!model <name>` — 切換模型（opus / sonnet / haiku / fable）",
+            "`[[ws:路徑]]` — 設定本 session 的工作目錄（可與任務同一則訊息）",
             "",
             "**工作模式**（`!cmd <task>`，後接任務內容）",
         ]
@@ -871,8 +926,15 @@ async def on_message(message: discord.Message):
         _save_sessions()
         log.info(f"Webhook passthrough auto-reset for {session_key} (user {message.author.id})")
 
+    # shared sessions (thread/channel scope): tag each buffered message with the
+    # speaker so Claude can tell participants apart (commands stay unprefixed)
+    if _is_shared_scope(session_key) and not content.startswith("!"):
+        speaker = getattr(message.author, "display_name", None) or str(message.author)
+        content = f"[{speaker}] {content}"
+
     # debounce: buffer content and restart sliding-window timer
     _pending_texts[session_key].append(content)
+    _pending_author[session_key] = message.author.id
     if session_key in _pending:
         _pending[session_key].cancel()
 
@@ -898,4 +960,14 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         sys.exit("DISCORD_TOKEN is not set")
+    # unattended-permissions mode with no user allowlist = anyone in the channel
+    # can run arbitrary commands on this machine; refuse unless explicitly overridden
+    if "--dangerously-skip-permissions" in CLAUDE_EXTRA_ARGS and not ALLOWED_USER_IDS:
+        if os.getenv("UNSAFE_ALLOW_ALL_USERS") != "1":
+            sys.exit(
+                "Refusing to start: --dangerously-skip-permissions is set but "
+                "ALLOWED_USER_IDS is empty (anyone could execute commands). "
+                "Set ALLOWED_USER_IDS, or set UNSAFE_ALLOW_ALL_USERS=1 to override."
+            )
+        log.warning("UNSAFE_ALLOW_ALL_USERS=1: skip-permissions with no user allowlist!")
     client.run(DISCORD_TOKEN)
