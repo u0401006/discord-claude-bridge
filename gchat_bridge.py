@@ -447,6 +447,15 @@ async def main() -> None:
         log.warning("UNSAFE_ALLOW_ALL_USERS=1: skip-permissions with no user allowlist!")
 
     from google.cloud import pubsub_v1
+    from google.oauth2.service_account import Credentials
+
+    # Explicit credentials for the subscriber too — never fall back to ADC,
+    # which may resolve to a different identity (e.g. a gcloud user login)
+    # than the service account the IAM bindings were granted to.
+    pubsub_creds = Credentials.from_service_account_file(
+        GOOGLE_APPLICATION_CREDENTIALS,
+        scopes=["https://www.googleapis.com/auth/pubsub"],
+    )
 
     loop = asyncio.get_running_loop()
 
@@ -462,7 +471,7 @@ async def main() -> None:
         pubsub_msg.ack()
         asyncio.run_coroutine_threadsafe(handle_event(event), loop)
 
-    subscriber = pubsub_v1.SubscriberClient()
+    subscriber = pubsub_v1.SubscriberClient(credentials=pubsub_creds)
     subscription_path = subscriber.subscription_path(GCHAT_PROJECT_ID, GCHAT_SUBSCRIPTION_ID)
     streaming_pull = subscriber.subscribe(subscription_path, callback=callback)
     log.info(f"Listening on {subscription_path} (backend: {CLAUDE_BIN})")
