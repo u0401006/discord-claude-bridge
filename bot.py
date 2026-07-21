@@ -26,7 +26,10 @@ for _i, _arg in enumerate(sys.argv[1:], 1):
         _env_path = sys.argv[_i + 1]
         break
 
-load_dotenv(_env_path)
+# override=True: an explicit --env file must win over a same-named var already
+# exported in the shell (e.g. a global GOOGLE_APPLICATION_CREDENTIALS set for
+# an unrelated tool) — otherwise .env settings can be silently ignored.
+load_dotenv(_env_path, override=True)
 
 logging.basicConfig(
     level=logging.INFO,
