@@ -116,6 +116,18 @@ class TestDedup(unittest.TestCase):
         self.assertFalse(gb.is_duplicate("m0"))  # evicted → treated as new
 
 
+class TestWithMention(unittest.TestCase):
+    def test_prepends_mention_token(self):
+        self.assertEqual(
+            gb._with_mention("hello", "users/1234567890"),
+            "<users/1234567890> hello",
+        )
+
+    def test_no_mention_passthrough(self):
+        self.assertEqual(gb._with_mention("hello", None), "hello")
+        self.assertEqual(gb._with_mention("hello", ""), "hello")
+
+
 class TestSessionInstruction(unittest.TestCase):
     def test_contains_space_and_thread(self):
         with patch.object(gb, "GCHAT_MCP_CONTEXT_HINT", True):

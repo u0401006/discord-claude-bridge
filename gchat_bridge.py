@@ -242,9 +242,23 @@ def _chat():
     return _chat_client
 
 
-async def send_message(space_name: str, text: str, thread_name: str | None) -> None:
-    """Send one message, chunked and throttled to the 1 write/s/space quota."""
+def _with_mention(text: str, mention: str | None) -> str:
+    """Prepend a Chat @-mention token (<users/1234567890>) if mention is given."""
+    return f"<{mention}> {text}" if mention else text
+
+
+async def send_message(
+    space_name: str, text: str, thread_name: str | None, mention: str | None = None
+) -> None:
+    """Send one message, chunked and throttled to the 1 write/s/space quota.
+
+    mention: a Chat user resource name ("users/1234567890") to @-mention at the
+    start of the message — mirrors bot.py always prepending author.mention, so
+    a reply in a shared thread/space always makes clear who it's addressing.
+    """
     from google.apps import chat_v1 as google_chat
+
+    text = _with_mention(text, mention)
 
     loop = asyncio.get_running_loop()
     for chunk in bridge_core.chunk_text(markdown_to_gchat(text), GCHAT_CHUNK):
@@ -341,12 +355,13 @@ async def handle_event(event: dict) -> None:
                 space_name,
                 f"無效的工作目錄 `{ws_path}`（必須是存在的目錄，且位於允許範圍內）",
                 thread_name,
+                mention=user_name,
             )
             return
         _session_workdir[session_key] = real
         _save_sessions()
         log.info(f"Workdir for {session_key}: {real}")
-        await send_message(space_name, f"工作目錄已設為 `{real}`", thread_name)
+        await send_message(space_name, f"工作目錄已設為 `{real}`", thread_name, mention=user_name)
         if not content:
             return  # directive-only message
 
@@ -357,15 +372,18 @@ async def handle_event(event: dict) -> None:
         _limit_notified.discard(session_key)
         _session_workdir.pop(session_key, None)
         _save_sessions()
-        await send_message(space_name, "Session cleared.", thread_name)
+        await send_message(space_name, "Session cleared.", thread_name, mention=user_name)
         return
 
     if content == "!cancel":
         if bridge_core.cancel_backend(session_key):
             log.info(f"Cancelled in-flight backend run for {session_key}")
-            await send_message(space_name, "⛔ 已中斷目前執行。session 保留，可直接繼續對話。", thread_name)
+            await send_message(
+                space_name, "⛔ 已中斷目前執行。session 保留，可直接繼續對話。", thread_name,
+                mention=user_name,
+            )
         else:
-            await send_message(space_name, "沒有進行中的任務。", thread_name)
+            await send_message(space_name, "沒有進行中的任務。", thread_name, mention=user_name)
         return
 
     if content == "!status":
@@ -379,7 +397,7 @@ async def handle_event(event: dict) -> None:
             f"- 模型: `{_session_model.get(session_key, 'default')}`",
             f"- 工作目錄: `{_session_workdir.get(session_key, WORKING_DIR)}`",
         ]
-        await send_message(space_name, "\n".join(lines), thread_name)
+        await send_message(space_name, "\n".join(lines), thread_name, mention=user_name)
         return
 
     if content == "!help":
@@ -393,12 +411,13 @@ async def handle_event(event: dict) -> None:
             "*工作模式*（`!cmd <task>`）",
         ]
         lines += [f"`{spec['help']}`" for spec in bridge_core.CMD_MAP.values()]
-        await send_message(space_name, "\n".join(lines), thread_name)
+        await send_message(space_name, "\n".join(lines), thread_name, mention=user_name)
         return
 
     if _rate_limiter.is_limited(user_name):
         await send_message(
-            space_name, f"Rate limit: max {RATE_LIMIT_PER_MIN} requests/min.", thread_name
+            space_name, f"Rate limit: max {RATE_LIMIT_PER_MIN} requests/min.", thread_name,
+            mention=user_name,
         )
         return
 
@@ -411,6 +430,7 @@ async def handle_event(event: dict) -> None:
                 space_name,
                 f"本對話已達上限 {MAX_TURNS} 輪，訊息不會再轉給後端。輸入 `!reset` 開啟新 session。",
                 thread_name,
+                mention=user_name,
             )
         return
 
@@ -430,7 +450,12 @@ async def handle_event(event: dict) -> None:
     )
     if reply == "":  # cancelled via !cancel — the cancel handler already replied
         return
-    await send_message(space_name, reply, thread_name)
+    # Always mention whoever triggered this turn — mirrors bot.py's author.mention.
+    # In a shared thread/space session this is the last speaker in this turn, not
+    # necessarily whoever the reply's content is actually addressing (Claude may
+    # name a different participant in the text) — that finer-grained targeting
+    # is a separate, bigger feature, not implemented here.
+    await send_message(space_name, reply, thread_name, mention=user_name)
 
 
 # ── Pub/Sub pull loop ─────────────────────────────────────────────────────────

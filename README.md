@@ -14,7 +14,7 @@ Chat bridge that connects messaging platforms (**Discord** via `bot.py`, **Googl
 - **Turn cap**: hard limit per session (default 20 turns); `!reset` starts a fresh session
 - **Memory flush**: `!flush` summarises the session and persists it to disk for future context
 - **Bot-loop prevention**: auto-stops forwarding when Claude returns a `[DONE]` signal or pure punctuation in a bot-to-bot turn
-- **Live progress** (`STREAM_PROGRESS=1`): tool-by-tool activity streamed into an auto-edited message instead of a 2-minute black box
+- **Live progress** (`STREAM_PROGRESS=1`, off by default): tool-by-tool activity streamed into an auto-edited message instead of a 2-minute black box — some users find the frequent edits distracting, so it's opt-in
 - **Cancellation**: `!cancel` kills the in-flight backend subprocess immediately, keeping the session
 
 ## Quick start
@@ -45,7 +45,7 @@ All settings are in the `.env` file (or environment variables):
 | `CLAUDE_EXTRA_ARGS` | (empty) | Extra flags passed to every AI call (e.g. `--dangerously-skip-permissions`; with this flag set, the bot refuses to start unless `ALLOWED_USER_IDS` is non-empty or `UNSAFE_ALLOW_ALL_USERS=1`) |
 | `SESSION_SCOPE` | `thread` | `thread` = shared session per thread, per-user in channels; `channel` = shared per channel; `user` = per channel/user pair (legacy) |
 | `CLAUDE_TIMEOUT` | `120` | Subprocess timeout in seconds |
-| `STREAM_PROGRESS` | `0` | `1` streams live tool activity into an auto-edited progress message (recommended with the claude CLI backend) |
+| `STREAM_PROGRESS` | `0` | `1` streams live tool activity into an auto-edited progress message. Off by default — can feel disruptive in busy channels |
 | `BACKEND_ENV_PASS` | — | Comma-separated env vars to re-allow into the backend subprocess (e.g. `OPENAI_API_KEY` for openai-adapter). By default `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` are stripped |
 | `BACKEND_ENV_DENY` | — | Extra env vars to strip from the backend subprocess |
 | `WS_ALLOWED_DIRS` | `~` | Colon-separated roots the `[[ws:path]]` directive may point into |
