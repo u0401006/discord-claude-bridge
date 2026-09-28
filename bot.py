@@ -62,6 +62,7 @@ WEBHOOK_PASSTHROUGH_IDS: set[int] = {
     int(x) for x in os.getenv("WEBHOOK_PASSTHROUGH_IDS", "").split(",") if x.strip()
 }
 WORKING_DIR = os.path.expanduser(os.getenv("WORKING_DIR", "~/agent-dev"))
+ATE_SHEETS_DIR = os.getenv("ATE_SHEETS_DIR", "").strip()
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 # Extra args prepended to every CLAUDE_BIN call.
 # Claude Code unattended mode: set --dangerously-skip-permissions explicitly in .env.
@@ -455,6 +456,9 @@ async def run_claude(
 
     # Inject exit-signal instruction once on the first turn of a new session
     send_prompt = prompt if session_id else _make_session_instruction(session_key) + prompt
+    if ATE_SHEETS_DIR:
+        from ate_integration import instruction
+        send_prompt = instruction(ATE_SHEETS_DIR) + send_prompt
 
     kwargs = dict(
         backend_bin=CLAUDE_BIN,
@@ -948,6 +952,10 @@ async def on_message(message: discord.Message):
         speaker = getattr(message.author, "display_name", None) or str(message.author)
         content = f"[{speaker}] {content}"
 
+    if ATE_SHEETS_DIR:
+        from ate_integration import message_context
+        content += message_context(message.id, message.author.id, message.created_at)
+
     # debounce: buffer content and restart sliding-window timer
     _pending_texts[session_key].append(content)
     _pending_author[session_key] = message.author.id
@@ -976,6 +984,8 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         sys.exit("DISCORD_TOKEN is not set")
+    if ATE_SHEETS_DIR and not ALLOWED_USER_IDS:
+        sys.exit("ATE_SHEETS_DIR requires ALLOWED_USER_IDS for this personal spreadsheet")
     # unattended-permissions mode with no user allowlist = anyone in the channel
     # can run arbitrary commands on this machine; refuse unless explicitly overridden
     if "--dangerously-skip-permissions" in CLAUDE_EXTRA_ARGS and not ALLOWED_USER_IDS:
