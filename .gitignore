@@ -11,3 +11,8 @@ __pycache__/
 *.pyo
 sessions.json
 memory/
+tools/ate_sheets/config.json
+tools/ate_sheets/.state/
+tools/ate_sheets/.venv/
+tools/ate_sheets/*credentials*.json
+tools/ate_sheets/*service-account*.json

@@ -1,0 +1,12 @@
+{
+  "spreadsheet_id": "YOUR_SPREADSHEET_ID",
+  "credentials_file": "/absolute/path/to/service-account.json",
+  "food_sheet": "資料庫",
+  "log_sheet": "log",
+  "timezone": "Asia/Taipei",
+  "state_dir": ".state",
+  "views": {
+    "today": {"sheet": "today", "range": "A1:M40"},
+    "history": {"sheet": "today", "range": "A6:D40"}
+  }
+}

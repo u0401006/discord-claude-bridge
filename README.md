@@ -117,6 +117,14 @@ launchctl load ~/Library/LaunchAgents/com.capo.discord-claude-bridge.plist
 
 Restart: `launchctl kickstart -k gui/$(id -u)/com.capo.discord-claude-bridge`
 
+## Optional food log in Google Sheets
+
+Claude Code and Codex CLI can call the bundled `gspread` tool to search foods,
+append intake records, and read existing pivot / daily-summary ranges. Supports
+per-100g foods, estimated calories, and calorie estimates from macronutrients.
+Opt in with `ATE_SHEETS_DIR`; no webhook or separate web server is required.
+See [setup and commands](docs/ate-sheets.md). Disabled by default.
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for component breakdown, security model, and state-persistence details.
